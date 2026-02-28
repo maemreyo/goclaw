@@ -60,12 +60,12 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
 
 	// Build multipart/form-data body.
 	// Fields:
-	//   file      — audio file bytes (required)
-	//   tenant_id — optional tenant identifier forwarded to the proxy
+	//   audio     — audio file bytes (required by speaking-service /transcribe_audio)
+	//   tenant_id — tenant identifier forwarded to the proxy (required by endpoint contract)
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
 
-	fw, err := w.CreateFormFile("file", filepath.Base(filePath))
+	fw, err := w.CreateFormFile("audio", filepath.Base(filePath))
 	if err != nil {
 		return "", fmt.Errorf("stt: create form file field: %w", err)
 	}
@@ -73,10 +73,12 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
 		return "", fmt.Errorf("stt: write audio bytes to form: %w", err)
 	}
 
-	if c.config.STTTenantID != "" {
-		if err := w.WriteField("tenant_id", c.config.STTTenantID); err != nil {
-			return "", fmt.Errorf("stt: write tenant_id field: %w", err)
-		}
+	tenantID := strings.TrimSpace(c.config.STTTenantID)
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	if err := w.WriteField("tenant_id", tenantID); err != nil {
+		return "", fmt.Errorf("stt: write tenant_id field: %w", err)
 	}
 
 	if err := w.Close(); err != nil {

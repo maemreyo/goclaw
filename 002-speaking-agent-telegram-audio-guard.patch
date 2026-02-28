@@ -1,0 +1,163 @@
+diff --git a/cmd/gateway_consumer.go b/cmd/gateway_consumer.go
+index 5916a23..9b58f76 100644
+--- a/cmd/gateway_consumer.go
++++ b/cmd/gateway_consumer.go
+@@ -4,7 +4,10 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"html"
+ 	"log/slog"
++	"os"
++	"regexp"
+ 	"strings"
+ 	"time"
+ 
+@@ -43,6 +46,7 @@ func makeSchedulerRunFunc(agents *agent.Router, cfg *config.Config) scheduler.Ru
+ // (matching TS subagent-announce.ts pattern) so the agent can reformulate for the user.
+ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents *agent.Router, cfg *config.Config, sched *scheduler.Scheduler, channelMgr *channels.Manager, teamStore store.TeamStore) {
+ 	slog.Info("inbound message consumer started")
++	defaultTenantID := resolveEduOSTenantID()
+ 
+ 	// Inbound message deduplication (matching TS src/infra/dedupe.ts + inbound-dedupe.ts).
+ 	// TTL=20min, max=5000 entries — prevents webhook retries / double-taps from duplicating agent runs.
+@@ -151,6 +155,31 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents
+ 				"- Keep responses concise and focused; long replies are disruptive in groups.\n" +
+ 				"- Address the group naturally. If the history shows a multi-person conversation, consider the full context before answering."
+ 		}
++		if agentID == "speaking-agent" && peerKind == string(sessions.PeerDirect) {
++			internalIdentityPrompt := fmt.Sprintf(
++				"You are in a private 1-on-1 student session on EduOS.\n"+
++					"Internal runtime identifiers (system-provided):\n"+
++					"- tenant_id: %s\n"+
++					"- student_id: %s\n"+
++					"Rules:\n"+
++					"- NEVER ask the student for tenant_id/student_id or any technical/internal ID.\n"+
++					"- For speaking tools that require tenant_id/student_id, always use these values.\n"+
++					"- Telegram audio notes may arrive as <media:voice>/<media:audio> tags with an inline <transcript>...</transcript> block.\n"+
++					"- When a transcript block exists, extract it and use text-based evaluation tools (e.g., evaluate_transcript).\n"+
++					"- On Telegram, NEVER call evaluate_audio or submit_audio_job for <media:voice>/<media:audio> placeholders.\n"+
++					"- If transcript is missing, ask the student to resend audio more clearly; do not restart onboarding or ask technical IDs.\n"+
++					"- NEVER tell students about internal/system/tool errors (e.g. 'system error', 'technical issue', 'exit status', 'rate limit').\n"+
++					"- If any tool fails, continue with best-effort coaching from available transcript/text and ask for a retry naturally.\n"+
++					"- If a tool still fails due profile mismatch/not found, continue coaching without asking for technical IDs.",
++				defaultTenantID,
++				userID,
++			)
++			if extraPrompt != "" {
++				extraPrompt += "\n\n" + internalIdentityPrompt
++			} else {
++				extraPrompt = internalIdentityPrompt
++			}
++		}
+ 
+ 		// Schedule through main lane (per-session concurrency controlled by maxConcurrent)
+ 		outCh := sched.ScheduleWithOpts(ctx, "main", agent.RunRequest{
+@@ -183,7 +212,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents
+ 		}
+ 
+ 		// Handle result asynchronously to not block the flush callback.
+-		go func(channel, chatID, session, rID string, meta map[string]string) {
++		go func(channel, chatID, session, rID, agentKey, peer string, originalContent string, meta map[string]string) {
+ 			outcome := <-outCh
+ 
+ 			// Clean up run tracking (in case HandleAgentEvent didn't fire for terminal events)
+@@ -231,11 +260,14 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents
+ 				return
+ 			}
+ 
++			replyContent := outcome.Result.Content
++			replyContent = sanitizeSpeakingAudioStudentReply(agentKey, channel, peer, originalContent, replyContent)
++
+ 			// Publish response back to the channel
+ 			outMsg := bus.OutboundMessage{
+ 				Channel:  channel,
+ 				ChatID:   chatID,
+-				Content:  outcome.Result.Content,
++				Content:  replyContent,
+ 				Metadata: meta,
+ 			}
+ 
+@@ -254,7 +286,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents
+ 			}
+ 
+ 			msgBus.PublishOutbound(outMsg)
+-		}(msg.Channel, msg.ChatID, sessionKey, runID, outMeta)
++		}(msg.Channel, msg.ChatID, sessionKey, runID, agentID, peerKind, msg.Content, outMeta)
+ 	}
+ 
+ 	// Inbound debounce: merge rapid messages from the same sender before processing.
+@@ -632,6 +664,73 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents
+ 	}
+ }
+ 
++func resolveEduOSTenantID() string {
++	for _, key := range []string{"GOCLAW_EDUOS_TENANT_ID", "GOCLAW_TENANT_ID", "TENANT_ID"} {
++		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
++			return v
++		}
++	}
++	return "default"
++}
++
++var transcriptTagRe = regexp.MustCompile(`(?s)<transcript>(.*?)</transcript>`)
++
++func sanitizeSpeakingAudioStudentReply(agentID, channel, peerKind, inboundContent, reply string) string {
++	if agentID != "speaking-agent" || channel != "telegram" || peerKind != string(sessions.PeerDirect) {
++		return reply
++	}
++	if !strings.Contains(inboundContent, "<media:voice>") && !strings.Contains(inboundContent, "<media:audio>") {
++		return reply
++	}
++	if !containsTechnicalErrorLanguage(reply) {
++		return reply
++	}
++
++	transcript := extractTranscriptFromInbound(inboundContent)
++	if transcript != "" {
++		return fmt.Sprintf(
++			"🎙️ Mình đã nhận transcript của bạn: \"%s\"\n\n✅ Bạn trả lời đúng hướng rồi.\n🎯 Bây giờ mở rộng thêm 2-3 câu theo cấu trúc: trả lời trực tiếp -> lý do -> ví dụ ngắn.\n\nGửi câu trả lời tiếp theo (voice hoặc text), mình chấm chi tiết ngay.",
++			transcript,
++		)
++	}
++
++	return "🎙️ Mình đã nhận voice của bạn rồi.\n\n🎯 Bạn nói lại chậm hơn một chút và gửi lại 1 lần nhé. Mình sẽ chấm ngay khi nhận được nội dung rõ hơn."
++}
++
++func containsTechnicalErrorLanguage(s string) bool {
++	lower := strings.ToLower(strings.TrimSpace(s))
++	if lower == "" {
++		return false
++	}
++	for _, marker := range []string{
++		"vấn đề kỹ thuật",
++		"vấn đề hệ thống",
++		"lỗi hệ thống",
++		"technical issue",
++		"system error",
++		"exit status",
++		"rate limit",
++		"api rate limit",
++		"tool error",
++	} {
++		if strings.Contains(lower, marker) {
++			return true
++		}
++	}
++	return false
++}
++
++func extractTranscriptFromInbound(content string) string {
++	m := transcriptTagRe.FindStringSubmatch(content)
++	if len(m) < 2 {
++		return ""
++	}
++	transcript := strings.TrimSpace(html.UnescapeString(m[1]))
++	transcript = strings.ReplaceAll(transcript, "\n", " ")
++	transcript = strings.Join(strings.Fields(transcript), " ")
++	return transcript
++}
++
+ // resolveAgentRoute determines which agent should handle a message
+ // based on config bindings. Priority: peer → channel → default.
+ // Matching TS resolve-route.ts binding resolution.

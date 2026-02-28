@@ -94,12 +94,12 @@ func TestTranscribeAudio_Success(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		// Verify multipart body contains a "file" field.
+		// Verify multipart body contains an "audio" field.
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Errorf("parse multipart: %v", err)
 		}
-		if _, _, err := r.FormFile("file"); err != nil {
-			t.Errorf("expected 'file' field in multipart form: %v", err)
+		if _, _, err := r.FormFile("audio"); err != nil {
+			t.Errorf("expected 'audio' field in multipart form: %v", err)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -196,17 +196,18 @@ func TestTranscribeAudio_TenantID(t *testing.T) {
 	}
 }
 
-// TestTranscribeAudio_NoTenantField verifies that when STTTenantID is empty, the
-// multipart form does NOT include a "tenant_id" field.
-func TestTranscribeAudio_NoTenantField(t *testing.T) {
+// TestTranscribeAudio_DefaultTenantFallback verifies that when STTTenantID is
+// empty, a default tenant_id value is still sent to satisfy the STT endpoint contract.
+func TestTranscribeAudio_DefaultTenantFallback(t *testing.T) {
 	audioFile := writeTempAudio(t, "fake-ogg-bytes")
 	defer os.Remove(audioFile)
 
+	const wantDefaultTenant = "default"
+	var gotTenant string
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(1 << 20); err == nil {
-			if tid := r.FormValue("tenant_id"); tid != "" {
-				t.Errorf("expected no tenant_id field, got %q", tid)
-			}
+			gotTenant = r.FormValue("tenant_id")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(sttResponse{Transcript: "ok"})
@@ -216,6 +217,9 @@ func TestTranscribeAudio_NoTenantField(t *testing.T) {
 	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotTenant != wantDefaultTenant {
+		t.Errorf("expected tenant_id %q, got %q", wantDefaultTenant, gotTenant)
 	}
 }
 

@@ -1,0 +1,135 @@
+diff --git a/internal/channels/telegram/stt.go b/internal/channels/telegram/stt.go
+index ef6bd09..d9c8979 100644
+--- a/internal/channels/telegram/stt.go
++++ b/internal/channels/telegram/stt.go
+@@ -11,6 +11,7 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -59,12 +60,12 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
+ 
+ 	// Build multipart/form-data body.
+ 	// Fields:
+-	//   file      — audio file bytes (required)
+-	//   tenant_id — optional tenant identifier forwarded to the proxy
++	//   audio     — audio file bytes (required by speaking-service /transcribe_audio)
++	//   tenant_id — tenant identifier forwarded to the proxy (required by endpoint contract)
+ 	var body bytes.Buffer
+ 	w := multipart.NewWriter(&body)
+ 
+-	fw, err := w.CreateFormFile("file", filepath.Base(filePath))
++	fw, err := w.CreateFormFile("audio", filepath.Base(filePath))
+ 	if err != nil {
+ 		return "", fmt.Errorf("stt: create form file field: %w", err)
+ 	}
+@@ -72,10 +73,12 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
+ 		return "", fmt.Errorf("stt: write audio bytes to form: %w", err)
+ 	}
+ 
+-	if c.config.STTTenantID != "" {
+-		if err := w.WriteField("tenant_id", c.config.STTTenantID); err != nil {
+-			return "", fmt.Errorf("stt: write tenant_id field: %w", err)
+-		}
++	tenantID := strings.TrimSpace(c.config.STTTenantID)
++	if tenantID == "" {
++		tenantID = "default"
++	}
++	if err := w.WriteField("tenant_id", tenantID); err != nil {
++		return "", fmt.Errorf("stt: write tenant_id field: %w", err)
+ 	}
+ 
+ 	if err := w.Close(); err != nil {
+@@ -86,7 +89,11 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
+ 	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+ 	defer cancel()
+ 
+-	url := c.config.STTProxyURL + sttTranscribeEndpoint
++	baseURL := strings.TrimRight(strings.TrimSpace(c.config.STTProxyURL), "/")
++	url := baseURL
++	if !strings.HasSuffix(baseURL, sttTranscribeEndpoint) {
++		url = baseURL + sttTranscribeEndpoint
++	}
+ 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, &body)
+ 	if err != nil {
+ 		return "", fmt.Errorf("stt: build request to %q: %w", url, err)
+@@ -119,15 +126,12 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
+ 		return "", fmt.Errorf("stt: parse response JSON: %w", err)
+ 	}
+ 
+-	slog.Debug("telegram: STT transcript received",
+-		"length", len(result.Transcript),
+-		"preview", func() string {
+-			if len(result.Transcript) > 80 {
+-				return result.Transcript[:80] + "..."
+-			}
+-			return result.Transcript
+-		}(),
+-	)
++	if result.Transcript == "" {
++		slog.Warn("telegram: STT transcript empty", "url", url)
++		return "", nil
++	}
++
++	slog.Info("telegram: STT transcript received", "length", len(result.Transcript))
+ 
+ 	return result.Transcript, nil
+ }
+diff --git a/internal/channels/telegram/stt_test.go b/internal/channels/telegram/stt_test.go
+index 70670fc..6c156af 100644
+--- a/internal/channels/telegram/stt_test.go
++++ b/internal/channels/telegram/stt_test.go
+@@ -94,12 +94,12 @@ func TestTranscribeAudio_Success(t *testing.T) {
+ 		if r.Method != http.MethodPost {
+ 			t.Errorf("expected POST, got %s", r.Method)
+ 		}
+-		// Verify multipart body contains a "file" field.
++		// Verify multipart body contains an "audio" field.
+ 		if err := r.ParseMultipartForm(1 << 20); err != nil {
+ 			t.Errorf("parse multipart: %v", err)
+ 		}
+-		if _, _, err := r.FormFile("file"); err != nil {
+-			t.Errorf("expected 'file' field in multipart form: %v", err)
++		if _, _, err := r.FormFile("audio"); err != nil {
++			t.Errorf("expected 'audio' field in multipart form: %v", err)
+ 		}
+ 
+ 		w.Header().Set("Content-Type", "application/json")
+@@ -196,17 +196,18 @@ func TestTranscribeAudio_TenantID(t *testing.T) {
+ 	}
+ }
+ 
+-// TestTranscribeAudio_NoTenantField verifies that when STTTenantID is empty, the
+-// multipart form does NOT include a "tenant_id" field.
+-func TestTranscribeAudio_NoTenantField(t *testing.T) {
++// TestTranscribeAudio_DefaultTenantFallback verifies that when STTTenantID is
++// empty, a default tenant_id value is still sent to satisfy the STT endpoint contract.
++func TestTranscribeAudio_DefaultTenantFallback(t *testing.T) {
+ 	audioFile := writeTempAudio(t, "fake-ogg-bytes")
+ 	defer os.Remove(audioFile)
+ 
++	const wantDefaultTenant = "default"
++	var gotTenant string
++
+ 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if err := r.ParseMultipartForm(1 << 20); err == nil {
+-			if tid := r.FormValue("tenant_id"); tid != "" {
+-				t.Errorf("expected no tenant_id field, got %q", tid)
+-			}
++			gotTenant = r.FormValue("tenant_id")
+ 		}
+ 		w.Header().Set("Content-Type", "application/json")
+ 		json.NewEncoder(w).Encode(sttResponse{Transcript: "ok"})
+@@ -217,6 +218,9 @@ func TestTranscribeAudio_NoTenantField(t *testing.T) {
+ 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
+ 		t.Fatalf("unexpected error: %v", err)
+ 	}
++	if gotTenant != wantDefaultTenant {
++		t.Errorf("expected tenant_id %q, got %q", wantDefaultTenant, gotTenant)
++	}
+ }
+ 
+ // TestTranscribeAudio_UpstreamError verifies that a non-200 response is surfaced
