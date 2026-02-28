@@ -33,11 +33,14 @@ func (l *Loop) IsRunning() bool { return l.activeRuns.Load() > 0 }
 
 // emitLLMSpan records an LLM call span if tracing is active.
 // When GOCLAW_TRACE_VERBOSE is set, messages are serialized as InputPreview.
-func (l *Loop) emitLLMSpan(ctx context.Context, start time.Time, iteration int, messages []providers.Message, resp *providers.ChatResponse, callErr error) {
+func (l *Loop) emitLLMSpan(ctx context.Context, start time.Time, iteration int, model string, messages []providers.Message, resp *providers.ChatResponse, callErr error) {
 	traceID := tracing.TraceIDFromContext(ctx)
 	collector := tracing.CollectorFromContext(ctx)
 	if collector == nil || traceID == uuid.Nil {
 		return
+	}
+	if model == "" {
+		model = l.model
 	}
 
 	now := time.Now().UTC()
@@ -45,11 +48,11 @@ func (l *Loop) emitLLMSpan(ctx context.Context, start time.Time, iteration int, 
 	span := store.SpanData{
 		TraceID:    traceID,
 		SpanType:   store.SpanTypeLLMCall,
-		Name:       fmt.Sprintf("%s/%s #%d", l.provider.Name(), l.model, iteration),
+		Name:       fmt.Sprintf("%s/%s #%d", l.provider.Name(), model, iteration),
 		StartTime:  start,
 		EndTime:    &now,
 		DurationMS: dur,
-		Model:      l.model,
+		Model:      model,
 		Provider:   l.provider.Name(),
 		Status:     store.SpanStatusCompleted,
 		Level:      store.SpanLevelDefault,

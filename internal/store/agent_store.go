@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
@@ -16,9 +17,9 @@ const (
 
 // Agent status constants.
 const (
-	AgentStatusActive      = "active"
-	AgentStatusInactive    = "inactive"
-	AgentStatusSummoning   = "summoning"
+	AgentStatusActive       = "active"
+	AgentStatusInactive     = "inactive"
+	AgentStatusSummoning    = "summoning"
 	AgentStatusSummonFailed = "summon_failed"
 )
 
@@ -134,6 +135,40 @@ func (a *AgentData) ParseThinkingLevel() string {
 		return ""
 	}
 	return cfg.ThinkingLevel
+}
+
+// ParseModelFallbacks extracts model_fallbacks from other_config JSONB.
+// Returns nil if not configured.
+func (a *AgentData) ParseModelFallbacks() []string {
+	if len(a.OtherConfig) == 0 {
+		return nil
+	}
+	var cfg struct {
+		ModelFallbacks []string `json:"model_fallbacks"`
+	}
+	if json.Unmarshal(a.OtherConfig, &cfg) != nil {
+		return nil
+	}
+	if len(cfg.ModelFallbacks) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(cfg.ModelFallbacks))
+	seen := make(map[string]struct{}, len(cfg.ModelFallbacks))
+	for _, m := range cfg.ModelFallbacks {
+		model := strings.TrimSpace(m)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		out = append(out, model)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // AgentShareData represents an agent share grant.

@@ -21,13 +21,13 @@ import (
 
 // ResolverDeps holds shared dependencies for the managed-mode agent resolver.
 type ResolverDeps struct {
-	AgentStore  store.AgentStore
-	ProviderReg *providers.Registry
-	Bus         bus.EventPublisher
-	Sessions    store.SessionStore
-	Tools       *tools.Registry
-	ToolPolicy  *tools.PolicyEngine
-	Skills      *skills.Loader
+	AgentStore     store.AgentStore
+	ProviderReg    *providers.Registry
+	Bus            bus.EventPublisher
+	Sessions       store.SessionStore
+	Tools          *tools.Registry
+	ToolPolicy     *tools.PolicyEngine
+	Skills         *skills.Loader
 	HasMemory      bool
 	OnEvent        func(AgentEvent)
 	TraceCollector *tracing.Collector
@@ -259,28 +259,28 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 		}
 
 		loop := NewLoop(LoopConfig{
-			ID:                ag.AgentKey,
-			AgentUUID:         ag.ID,
-			AgentType:         ag.AgentType,
-			Provider:          provider,
-			Model:             ag.Model,
-			ContextWindow:     contextWindow,
-			MaxIterations:     maxIter,
-			Workspace:         workspace,
-			Bus:               deps.Bus,
-			Sessions:          deps.Sessions,
-			Tools:             toolsReg,
-			ToolPolicy:        deps.ToolPolicy,
-			AgentToolPolicy:   ag.ParseToolsConfig(),
-			SkillsLoader:      deps.Skills,
-			HasMemory:         hasMemory,
-			ContextFiles:      contextFiles,
-			EnsureUserFiles:   deps.EnsureUserFiles,
-			ContextFileLoader: deps.ContextFileLoader,
-			BootstrapCleanup:  deps.BootstrapCleanup,
-			OnEvent:           deps.OnEvent,
-			TraceCollector:    deps.TraceCollector,
-			InjectionAction:   deps.InjectionAction,
+			ID:                     ag.AgentKey,
+			AgentUUID:              ag.ID,
+			AgentType:              ag.AgentType,
+			Provider:               provider,
+			Model:                  ag.Model,
+			ContextWindow:          contextWindow,
+			MaxIterations:          maxIter,
+			Workspace:              workspace,
+			Bus:                    deps.Bus,
+			Sessions:               deps.Sessions,
+			Tools:                  toolsReg,
+			ToolPolicy:             deps.ToolPolicy,
+			AgentToolPolicy:        ag.ParseToolsConfig(),
+			SkillsLoader:           deps.Skills,
+			HasMemory:              hasMemory,
+			ContextFiles:           contextFiles,
+			EnsureUserFiles:        deps.EnsureUserFiles,
+			ContextFileLoader:      deps.ContextFileLoader,
+			BootstrapCleanup:       deps.BootstrapCleanup,
+			OnEvent:                deps.OnEvent,
+			TraceCollector:         deps.TraceCollector,
+			InjectionAction:        deps.InjectionAction,
 			MaxMessageChars:        deps.MaxMessageChars,
 			CompactionCfg:          compactionCfg,
 			ContextPruningCfg:      contextPruningCfg,
@@ -288,7 +288,8 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			SandboxContainerDir:    sandboxContainerDir,
 			SandboxWorkspaceAccess: sandboxWorkspaceAccess,
 			BuiltinToolSettings:    builtinSettings,
-			ThinkingLevel:         ag.ParseThinkingLevel(),
+			ThinkingLevel:          ag.ParseThinkingLevel(),
+			ModelFallbacks:         ag.ParseModelFallbacks(),
 		})
 
 		slog.Info("resolved agent from DB", "agent", agentKey, "model", ag.Model, "provider", ag.Provider)
