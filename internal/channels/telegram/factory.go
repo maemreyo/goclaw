@@ -27,6 +27,11 @@ type telegramInstanceConfig struct {
 	MediaMaxBytes  int64    `json:"media_max_bytes,omitempty"`
 	LinkPreview    *bool    `json:"link_preview,omitempty"`
 	AllowFrom      []string `json:"allow_from,omitempty"`
+	STTProxyURL    string   `json:"stt_proxy_url,omitempty"`
+	STTAPIKey      string   `json:"stt_api_key,omitempty"`
+	STTTenantID    string   `json:"stt_tenant_id,omitempty"`
+	STTTimeoutSec  int      `json:"stt_timeout_seconds,omitempty"`
+	VoiceAgentID   string   `json:"voice_agent_id,omitempty"`
 }
 
 // Factory creates a Telegram channel from DB instance data (no agent/team store).
@@ -65,18 +70,23 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 	}
 
 	tgCfg := config.TelegramConfig{
-		Enabled:        true,
-		Token:          c.Token,
-		Proxy:          c.Proxy,
-		AllowFrom:      ic.AllowFrom,
-		DMPolicy:       ic.DMPolicy,
-		GroupPolicy:    ic.GroupPolicy,
-		RequireMention: ic.RequireMention,
-		HistoryLimit:   ic.HistoryLimit,
-		StreamMode:     ic.StreamMode,
-		ReactionLevel:  ic.ReactionLevel,
-		MediaMaxBytes:  ic.MediaMaxBytes,
-		LinkPreview:    ic.LinkPreview,
+		Enabled:           true,
+		Token:             c.Token,
+		Proxy:             c.Proxy,
+		AllowFrom:         ic.AllowFrom,
+		DMPolicy:          ic.DMPolicy,
+		GroupPolicy:       ic.GroupPolicy,
+		RequireMention:    ic.RequireMention,
+		HistoryLimit:      ic.HistoryLimit,
+		StreamMode:        ic.StreamMode,
+		ReactionLevel:     ic.ReactionLevel,
+		MediaMaxBytes:     ic.MediaMaxBytes,
+		LinkPreview:       ic.LinkPreview,
+		STTProxyURL:       ic.STTProxyURL,
+		STTAPIKey:         ic.STTAPIKey,
+		STTTenantID:       ic.STTTenantID,
+		STTTimeoutSeconds: ic.STTTimeoutSec,
+		VoiceAgentID:      ic.VoiceAgentID,
 	}
 
 	// DB instances default to "pairing" for groups (secure by default).

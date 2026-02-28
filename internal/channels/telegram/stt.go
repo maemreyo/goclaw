@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -86,7 +87,11 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
 	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	url := c.config.STTProxyURL + sttTranscribeEndpoint
+	baseURL := strings.TrimRight(strings.TrimSpace(c.config.STTProxyURL), "/")
+	url := baseURL
+	if !strings.HasSuffix(baseURL, sttTranscribeEndpoint) {
+		url = baseURL + sttTranscribeEndpoint
+	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, &body)
 	if err != nil {
 		return "", fmt.Errorf("stt: build request to %q: %w", url, err)
@@ -119,15 +124,12 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
 		return "", fmt.Errorf("stt: parse response JSON: %w", err)
 	}
 
-	slog.Debug("telegram: STT transcript received",
-		"length", len(result.Transcript),
-		"preview", func() string {
-			if len(result.Transcript) > 80 {
-				return result.Transcript[:80] + "..."
-			}
-			return result.Transcript
-		}(),
-	)
+	if result.Transcript == "" {
+		slog.Warn("telegram: STT transcript empty", "url", url)
+		return "", nil
+	}
+
+	slog.Info("telegram: STT transcript received", "length", len(result.Transcript))
 
 	return result.Transcript, nil
 }

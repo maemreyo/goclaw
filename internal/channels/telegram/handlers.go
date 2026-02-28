@@ -15,6 +15,13 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
 )
 
+const dmAffinityTTL = 6 * time.Hour
+
+type dmAffinity struct {
+	AgentID   string
+	UpdatedAt time.Time
+}
+
 // handleMessage processes an incoming Telegram update.
 func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	message := update.Message
@@ -181,6 +188,11 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 					)
 				} else {
 					m.Transcript = transcript
+					if transcript != "" {
+						slog.Info("telegram: transcript attached to inbound media",
+							"type", m.Type, "chars", len(transcript),
+						)
+					}
 				}
 
 			case "document":
@@ -379,14 +391,58 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	// This prevents voice turns from landing on a text-router agent that cannot handle audio.
 	targetAgentID := c.AgentID()
 	if c.config.VoiceAgentID != "" {
+		routeReason := ""
 		for _, m := range mediaList {
 			if m.Type == "audio" || m.Type == "voice" {
 				targetAgentID = c.config.VoiceAgentID
-				slog.Debug("telegram: routing voice inbound to speaking agent",
-					"agent_id", targetAgentID, "media_type", m.Type,
-				)
+				routeReason = "audio_media"
 				break
 			}
+		}
+
+		if routeReason == "" && !isGroup {
+			normalized := strings.ToLower(strings.TrimSpace(content))
+			switch {
+			case normalized == "/start" || normalized == "start":
+				targetAgentID = c.config.VoiceAgentID
+				routeReason = "start_command"
+				// Normalize /start into an explicit learning intent for speaking-agent.
+				finalContent = "Bắt đầu buổi luyện speaking hôm nay. User vừa gửi lệnh /start."
+			case looksLikeSpeakingIntent(normalized):
+				targetAgentID = c.config.VoiceAgentID
+				routeReason = "speaking_intent"
+			}
+
+			if routeReason == "" {
+				if looksLikeNonSpeakingIntent(normalized) {
+					c.dmAgentAffinity.Delete(chatIDStr)
+					slog.Info("telegram: cleared DM affinity due to non-speaking intent", "chat_id", chatIDStr)
+				} else if v, ok := c.dmAgentAffinity.Load(chatIDStr); ok {
+					if affinity, ok := v.(dmAffinity); ok {
+						if time.Since(affinity.UpdatedAt) <= dmAffinityTTL && affinity.AgentID != "" {
+							targetAgentID = affinity.AgentID
+							routeReason = "session_affinity"
+						} else {
+							c.dmAgentAffinity.Delete(chatIDStr)
+						}
+					}
+				}
+			}
+		}
+
+		if routeReason == "audio_media" || routeReason == "start_command" || routeReason == "speaking_intent" || routeReason == "session_affinity" {
+			c.dmAgentAffinity.Store(chatIDStr, dmAffinity{
+				AgentID:   c.config.VoiceAgentID,
+				UpdatedAt: time.Now(),
+			})
+		}
+
+		if routeReason != "" {
+			slog.Info("telegram: routing inbound to dedicated speaking agent",
+				"agent_id", targetAgentID,
+				"reason", routeReason,
+				"peer_kind", peerKind,
+			)
 		}
 	}
 
@@ -407,6 +463,61 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	if isGroup {
 		c.groupHistory.Clear(localKey)
 	}
+}
+
+func looksLikeSpeakingIntent(normalized string) bool {
+	if normalized == "" {
+		return false
+	}
+
+	keywords := []string{
+		"speaking",
+		"luyen noi",
+		"luyện nói",
+		"luyen speaking",
+		"hoc speaking",
+		"học speaking",
+		"do you prefer",
+		"pronunciation",
+		"phat am",
+		"phát âm",
+		"ielts part 1",
+		"ielts part 2",
+		"ielts part 3",
+	}
+
+	for _, kw := range keywords {
+		if strings.Contains(normalized, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeNonSpeakingIntent(normalized string) bool {
+	if normalized == "" {
+		return false
+	}
+
+	keywords := []string{
+		// Finance
+		"học phí", "hoc phi", "đóng tiền", "dong tien", "payment", "invoice", "công nợ", "cong no",
+		// Homework
+		"bài tập", "bai tap", "homework", "nộp bài", "nop bai", "deadline",
+		// Schedule
+		"lịch", "lich", "schedule", "xin nghỉ", "xin nghi", "nghỉ học", "nghi hoc", "lịch bù", "lich bu", "makeup",
+		// Admissions
+		"khóa học", "khoa hoc", "đăng ký", "dang ky", "tư vấn", "tu van", "học thử", "hoc thu", "course info",
+		// Writing
+		"writing", "essay", "chấm bài", "cham bai", "task 1", "task 2",
+	}
+
+	for _, kw := range keywords {
+		if strings.Contains(normalized, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectMention checks if a Telegram message mentions the bot.

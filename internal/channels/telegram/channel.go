@@ -34,11 +34,12 @@ type Channel struct {
 	pairingReplySent sync.Map         // userID string → time.Time (debounce pairing replies)
 	threadIDs        sync.Map         // localKey string → messageThreadID int (for forum topic routing)
 	approvedGroups   sync.Map         // chatIDStr string → true (cached group pairing approval)
+	dmAgentAffinity  sync.Map         // chatIDStr string → dmAffinity (sticky DM route)
 	groupHistory     *channels.PendingHistory
 	historyLimit     int
 	requireMention   bool
 	pollCancel       context.CancelFunc // cancels the long polling context
-	pollDone         chan struct{}       // closed when polling goroutine exits
+	pollDone         chan struct{}      // closed when polling goroutine exits
 }
 
 type thinkingCancel struct {

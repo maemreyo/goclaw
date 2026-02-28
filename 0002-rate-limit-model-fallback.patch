@@ -1,0 +1,744 @@
+diff --git a/internal/agent/loop.go b/internal/agent/loop.go
+index 4037c5a..270c74c 100644
+--- a/internal/agent/loop.go
++++ b/internal/agent/loop.go
+@@ -3,6 +3,7 @@ package agent
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"log/slog"
+ 	"os"
+@@ -44,21 +45,22 @@ type BootstrapCleanupFunc func(ctx context.Context, agentID uuid.UUID, userID st
+ // Loop is the agent execution loop for one agent instance.
+ // Think → Act → Observe cycle with tool execution.
+ type Loop struct {
+-	id            string
+-	agentUUID     uuid.UUID // set in managed mode for context propagation
+-	agentType     string    // "open" or "predefined" (managed mode)
+-	provider      providers.Provider
+-	model         string
+-	contextWindow int
+-	maxIterations int
+-	workspace     string
+-
+-	eventPub   bus.EventPublisher // currently unused by Loop; kept for future use
+-	sessions   store.SessionStore
++	id             string
++	agentUUID      uuid.UUID // set in managed mode for context propagation
++	agentType      string    // "open" or "predefined" (managed mode)
++	provider       providers.Provider
++	model          string
++	modelFallbacks []string
++	contextWindow  int
++	maxIterations  int
++	workspace      string
++
++	eventPub        bus.EventPublisher // currently unused by Loop; kept for future use
++	sessions        store.SessionStore
+ 	tools           *tools.Registry
+ 	toolPolicy      *tools.PolicyEngine    // optional: filters tools sent to LLM
+ 	agentToolPolicy *config.ToolPolicySpec // per-agent tool policy from DB (nil = no restrictions)
+-	activeRuns atomic.Int32 // number of currently executing runs
++	activeRuns      atomic.Int32           // number of currently executing runs
+ 
+ 	// Per-session summarization lock: prevents concurrent summarize goroutines for the same session.
+ 	summarizeMu sync.Map // sessionKey → *sync.Mutex
+@@ -71,10 +73,10 @@ type Loop struct {
+ 	contextFiles   []bootstrap.ContextFile
+ 
+ 	// Per-user file seeding + dynamic context loading (managed mode)
+-	ensureUserFiles    EnsureUserFilesFunc
+-	contextFileLoader  ContextFileLoaderFunc
+-	bootstrapCleanup   BootstrapCleanupFunc
+-	seededUsers        sync.Map // userID → true, avoid re-check per request
++	ensureUserFiles   EnsureUserFilesFunc
++	contextFileLoader ContextFileLoaderFunc
++	bootstrapCleanup  BootstrapCleanupFunc
++	seededUsers       sync.Map // userID → true, avoid re-check per request
+ 
+ 	// Compaction config (memory flush settings)
+ 	compactionCfg *config.CompactionConfig
+@@ -83,8 +85,8 @@ type Loop struct {
+ 	contextPruningCfg *config.ContextPruningConfig
+ 
+ 	// Sandbox info
+-	sandboxEnabled        bool
+-	sandboxContainerDir   string
++	sandboxEnabled         bool
++	sandboxContainerDir    string
+ 	sandboxWorkspaceAccess string
+ 
+ 	// Event callback for broadcasting agent events (run.started, chunk, tool.call, etc.)
+@@ -107,7 +109,7 @@ type Loop struct {
+ 
+ // AgentEvent is emitted during agent execution for WS broadcasting.
+ type AgentEvent struct {
+-	Type    string      `json:"type"`    // "run.started", "run.completed", "run.failed", "chunk", "tool.call", "tool.result"
++	Type    string      `json:"type"` // "run.started", "run.completed", "run.failed", "chunk", "tool.call", "tool.result"
+ 	AgentID string      `json:"agentId"`
+ 	RunID   string      `json:"runId"`
+ 	Payload interface{} `json:"payload,omitempty"`
+@@ -115,14 +117,15 @@ type AgentEvent struct {
+ 
+ // LoopConfig configures a new Loop.
+ type LoopConfig struct {
+-	ID            string
+-	Provider      providers.Provider
+-	Model         string
+-	ContextWindow int
+-	MaxIterations int
+-	Workspace     string
+-	Bus           bus.EventPublisher
+-	Sessions      store.SessionStore
++	ID              string
++	Provider        providers.Provider
++	Model           string
++	ModelFallbacks  []string
++	ContextWindow   int
++	MaxIterations   int
++	Workspace       string
++	Bus             bus.EventPublisher
++	Sessions        store.SessionStore
+ 	Tools           *tools.Registry
+ 	ToolPolicy      *tools.PolicyEngine    // optional: filters tools sent to LLM
+ 	AgentToolPolicy *config.ToolPolicySpec // per-agent tool policy from DB (nil = no restrictions)
+@@ -142,8 +145,8 @@ type LoopConfig struct {
+ 	ContextPruningCfg *config.ContextPruningConfig
+ 
+ 	// Sandbox info (injected into system prompt)
+-	SandboxEnabled        bool
+-	SandboxContainerDir   string // e.g. "/workspace"
++	SandboxEnabled         bool
++	SandboxContainerDir    string // e.g. "/workspace"
+ 	SandboxWorkspaceAccess string // "none", "ro", "rw"
+ 
+ 	// Managed mode: agent UUID for context propagation to tools
+@@ -159,9 +162,9 @@ type LoopConfig struct {
+ 	TraceCollector *tracing.Collector
+ 
+ 	// Security: input guard for injection detection, max message size
+-	InputGuard      *InputGuard    // nil = auto-create when InjectionAction != "off"
+-	InjectionAction string         // "log", "warn" (default), "block", "off"
+-	MaxMessageChars int            // 0 = use default (32000)
++	InputGuard      *InputGuard // nil = auto-create when InjectionAction != "off"
++	InjectionAction string      // "log", "warn" (default), "block", "off"
++	MaxMessageChars int         // 0 = use default (32000)
+ 
+ 	// Global builtin tool settings (from builtin_tools table, managed mode)
+ 	BuiltinToolSettings tools.BuiltinToolSettings
+@@ -193,61 +196,83 @@ func NewLoop(cfg LoopConfig) *Loop {
+ 		guard = NewInputGuard()
+ 	}
+ 
++	// Normalize model fallback list: trim, dedupe, exclude primary model.
++	fallbacks := make([]string, 0, len(cfg.ModelFallbacks))
++	if len(cfg.ModelFallbacks) > 0 {
++		seen := map[string]struct{}{}
++		primary := strings.TrimSpace(cfg.Model)
++		if primary != "" {
++			seen[primary] = struct{}{}
++		}
++		for _, raw := range cfg.ModelFallbacks {
++			model := strings.TrimSpace(raw)
++			if model == "" {
++				continue
++			}
++			if _, ok := seen[model]; ok {
++				continue
++			}
++			seen[model] = struct{}{}
++			fallbacks = append(fallbacks, model)
++		}
++	}
++
+ 	return &Loop{
+-		id:            cfg.ID,
+-		agentUUID:     cfg.AgentUUID,
+-		agentType:     cfg.AgentType,
+-		provider:      cfg.Provider,
+-		model:         cfg.Model,
+-		contextWindow: cfg.ContextWindow,
+-		maxIterations: cfg.MaxIterations,
+-		workspace:     cfg.Workspace,
+-		eventPub:      cfg.Bus,
+-		sessions:      cfg.Sessions,
+-		tools:           cfg.Tools,
+-		toolPolicy:      cfg.ToolPolicy,
+-		agentToolPolicy: cfg.AgentToolPolicy,
+-		onEvent:         cfg.OnEvent,
+-		ownerIDs:      cfg.OwnerIDs,
+-		skillsLoader:   cfg.SkillsLoader,
+-		skillAllowList: cfg.SkillAllowList,
+-		hasMemory:     cfg.HasMemory,
+-		contextFiles:  cfg.ContextFiles,
+-		ensureUserFiles:    cfg.EnsureUserFiles,
+-		contextFileLoader:  cfg.ContextFileLoader,
+-		bootstrapCleanup:   cfg.BootstrapCleanup,
+-		compactionCfg:     cfg.CompactionCfg,
+-		contextPruningCfg: cfg.ContextPruningCfg,
+-		sandboxEnabled:        cfg.SandboxEnabled,
+-		sandboxContainerDir:   cfg.SandboxContainerDir,
++		id:                     cfg.ID,
++		agentUUID:              cfg.AgentUUID,
++		agentType:              cfg.AgentType,
++		provider:               cfg.Provider,
++		model:                  cfg.Model,
++		modelFallbacks:         fallbacks,
++		contextWindow:          cfg.ContextWindow,
++		maxIterations:          cfg.MaxIterations,
++		workspace:              cfg.Workspace,
++		eventPub:               cfg.Bus,
++		sessions:               cfg.Sessions,
++		tools:                  cfg.Tools,
++		toolPolicy:             cfg.ToolPolicy,
++		agentToolPolicy:        cfg.AgentToolPolicy,
++		onEvent:                cfg.OnEvent,
++		ownerIDs:               cfg.OwnerIDs,
++		skillsLoader:           cfg.SkillsLoader,
++		skillAllowList:         cfg.SkillAllowList,
++		hasMemory:              cfg.HasMemory,
++		contextFiles:           cfg.ContextFiles,
++		ensureUserFiles:        cfg.EnsureUserFiles,
++		contextFileLoader:      cfg.ContextFileLoader,
++		bootstrapCleanup:       cfg.BootstrapCleanup,
++		compactionCfg:          cfg.CompactionCfg,
++		contextPruningCfg:      cfg.ContextPruningCfg,
++		sandboxEnabled:         cfg.SandboxEnabled,
++		sandboxContainerDir:    cfg.SandboxContainerDir,
+ 		sandboxWorkspaceAccess: cfg.SandboxWorkspaceAccess,
+-		traceCollector:        cfg.TraceCollector,
+-		inputGuard:            guard,
+-		injectionAction:       action,
+-		maxMessageChars:       cfg.MaxMessageChars,
+-		builtinToolSettings:   cfg.BuiltinToolSettings,
+-		thinkingLevel:         cfg.ThinkingLevel,
++		traceCollector:         cfg.TraceCollector,
++		inputGuard:             guard,
++		injectionAction:        action,
++		maxMessageChars:        cfg.MaxMessageChars,
++		builtinToolSettings:    cfg.BuiltinToolSettings,
++		thinkingLevel:          cfg.ThinkingLevel,
+ 	}
+ }
+ 
+ // RunRequest is the input for processing a message through the agent.
+ type RunRequest struct {
+-	SessionKey       string // composite key: agent:{agentId}:{channel}:{peerKind}:{chatId}
+-	Message          string // user message
+-	Media            []string // local file paths to images (already sanitized)
+-	Channel          string // source channel
+-	ChatID           string // source chat ID
+-	PeerKind         string // "direct" or "group" (for session key building and tool context)
+-	RunID            string // unique run identifier
+-	UserID           string // external user ID (TEXT, free-form) for multi-tenant scoping
+-	SenderID         string // original individual sender ID (preserved in group chats for permission checks)
+-	Stream           bool   // whether to stream response chunks
+-	ExtraSystemPrompt string // optional: injected into system prompt (skills, subagent context, etc.)
+-	HistoryLimit     int    // max user turns to keep in context (0=unlimited, from channel config)
+-	ParentTraceID    uuid.UUID // if set, reuse parent trace instead of creating new (announce runs)
+-	ParentRootSpanID uuid.UUID // if set, nest announce agent span under this parent span
+-	TraceName        string    // override trace name (default: "chat <agentID>")
+-	TraceTags        []string  // additional tags for the trace (e.g. "cron")
++	SessionKey        string    // composite key: agent:{agentId}:{channel}:{peerKind}:{chatId}
++	Message           string    // user message
++	Media             []string  // local file paths to images (already sanitized)
++	Channel           string    // source channel
++	ChatID            string    // source chat ID
++	PeerKind          string    // "direct" or "group" (for session key building and tool context)
++	RunID             string    // unique run identifier
++	UserID            string    // external user ID (TEXT, free-form) for multi-tenant scoping
++	SenderID          string    // original individual sender ID (preserved in group chats for permission checks)
++	Stream            bool      // whether to stream response chunks
++	ExtraSystemPrompt string    // optional: injected into system prompt (skills, subagent context, etc.)
++	HistoryLimit      int       // max user turns to keep in context (0=unlimited, from channel config)
++	ParentTraceID     uuid.UUID // if set, reuse parent trace instead of creating new (announce runs)
++	ParentRootSpanID  uuid.UUID // if set, nest announce agent span under this parent span
++	TraceName         string    // override trace name (default: "chat <agentID>")
++	TraceTags         []string  // additional tags for the trace (e.g. "cron")
+ }
+ 
+ // RunResult is the output of a completed agent run.
+@@ -261,11 +286,112 @@ type RunResult struct {
+ 
+ // MediaResult represents a media file produced by a tool during the agent run.
+ type MediaResult struct {
+-	Path        string `json:"path"`                  // local file path
++	Path        string `json:"path"`                   // local file path
+ 	ContentType string `json:"content_type,omitempty"` // MIME type
+ 	AsVoice     bool   `json:"as_voice,omitempty"`     // send as voice message (Telegram OGG)
+ }
+ 
++// modelCandidates returns primary model + configured fallbacks, de-duplicated.
++// Empty model is kept as a single candidate to allow provider default model usage.
++func (l *Loop) modelCandidates(primary string) []string {
++	candidates := make([]string, 0, 1+len(l.modelFallbacks))
++	seen := map[string]struct{}{}
++	add := func(raw string) {
++		model := strings.TrimSpace(raw)
++		if model == "" {
++			return
++		}
++		if _, ok := seen[model]; ok {
++			return
++		}
++		seen[model] = struct{}{}
++		candidates = append(candidates, model)
++	}
++
++	add(primary)
++	for _, m := range l.modelFallbacks {
++		add(m)
++	}
++	if len(candidates) == 0 {
++		return []string{""}
++	}
++	return candidates
++}
++
++// callProviderWithFallback calls the provider and retries with fallback models
++// when the upstream rejects the primary model due to rate limiting.
++func (l *Loop) callProviderWithFallback(
++	ctx context.Context,
++	req providers.ChatRequest,
++	stream bool,
++	onChunk func(providers.StreamChunk),
++) (*providers.ChatResponse, string, error) {
++	candidates := l.modelCandidates(req.Model)
++	var lastErr error
++	lastModel := req.Model
++
++	for idx, model := range candidates {
++		chatReq := req
++		chatReq.Model = model
++
++		var (
++			resp *providers.ChatResponse
++			err  error
++		)
++		if stream {
++			resp, err = l.provider.ChatStream(ctx, chatReq, onChunk)
++		} else {
++			resp, err = l.provider.Chat(ctx, chatReq)
++		}
++		if err == nil {
++			if idx > 0 {
++				slog.Warn("llm model fallback succeeded",
++					"agent", l.id,
++					"provider", l.provider.Name(),
++					"model", model,
++					"attempt", idx+1,
++					"candidates", len(candidates),
++				)
++			}
++			return resp, model, nil
++		}
++
++		lastErr = err
++		lastModel = model
++		if !isRateLimitFailure(err) || idx == len(candidates)-1 {
++			return nil, model, err
++		}
++
++		nextModel := candidates[idx+1]
++		slog.Warn("llm model rate-limited; trying fallback model",
++			"agent", l.id,
++			"provider", l.provider.Name(),
++			"current_model", model,
++			"next_model", nextModel,
++			"attempt", idx+1,
++			"candidates", len(candidates),
++			"error", err.Error(),
++		)
++	}
++
++	return nil, lastModel, lastErr
++}
++
++func isRateLimitFailure(err error) bool {
++	if err == nil {
++		return false
++	}
++	var httpErr *providers.HTTPError
++	if errors.As(err, &httpErr) {
++		return httpErr.Status == 429
++	}
++	lower := strings.ToLower(err.Error())
++	return strings.Contains(lower, "rate limit") ||
++		strings.Contains(lower, "too many requests") ||
++		strings.Contains(lower, "quota exceeded") ||
++		strings.Contains(lower, "resource_exhausted")
++}
++
+ // Run processes a single message through the agent loop.
+ // It blocks until completion and returns the final response.
+ func (l *Loop) Run(ctx context.Context, req RunRequest) (*RunResult, error) {
+@@ -512,7 +638,7 @@ func (l *Loop) runLoop(ctx context.Context, req RunRequest) (*RunResult, error)
+ 	var totalUsage providers.Usage
+ 	iteration := 0
+ 	var finalContent string
+-	var asyncToolCalls []string  // track async spawn tool names for fallback
++	var asyncToolCalls []string    // track async spawn tool names for fallback
+ 	var mediaResults []MediaResult // media files from tool MEDIA: results
+ 
+ 	// Inject retry hook so channels can update placeholder on LLM retries.
+@@ -563,38 +689,34 @@ func (l *Loop) runLoop(ctx context.Context, req RunRequest) (*RunResult, error)
+ 		// Call LLM (streaming or non-streaming)
+ 		var resp *providers.ChatResponse
+ 		var err error
++		var usedModel string
+ 
+ 		llmSpanStart := time.Now().UTC()
+-
+-		if req.Stream {
+-			resp, err = l.provider.ChatStream(ctx, chatReq, func(chunk providers.StreamChunk) {
+-				if chunk.Thinking != "" {
+-					l.emit(AgentEvent{
+-						Type:    protocol.ChatEventThinking,
+-						AgentID: l.id,
+-						RunID:   req.RunID,
+-						Payload: map[string]string{"content": chunk.Thinking},
+-					})
+-				}
+-				if chunk.Content != "" {
+-					l.emit(AgentEvent{
+-						Type:    protocol.ChatEventChunk,
+-						AgentID: l.id,
+-						RunID:   req.RunID,
+-						Payload: map[string]string{"content": chunk.Content},
+-					})
+-				}
+-			})
+-		} else {
+-			resp, err = l.provider.Chat(ctx, chatReq)
+-		}
++		resp, usedModel, err = l.callProviderWithFallback(ctx, chatReq, req.Stream, func(chunk providers.StreamChunk) {
++			if chunk.Thinking != "" {
++				l.emit(AgentEvent{
++					Type:    protocol.ChatEventThinking,
++					AgentID: l.id,
++					RunID:   req.RunID,
++					Payload: map[string]string{"content": chunk.Thinking},
++				})
++			}
++			if chunk.Content != "" {
++				l.emit(AgentEvent{
++					Type:    protocol.ChatEventChunk,
++					AgentID: l.id,
++					RunID:   req.RunID,
++					Payload: map[string]string{"content": chunk.Content},
++				})
++			}
++		})
+ 
+ 		if err != nil {
+-			l.emitLLMSpan(ctx, llmSpanStart, iteration, messages, nil, err)
++			l.emitLLMSpan(ctx, llmSpanStart, iteration, usedModel, messages, nil, err)
+ 			return nil, fmt.Errorf("LLM call failed (iteration %d): %w", iteration, err)
+ 		}
+ 
+-		l.emitLLMSpan(ctx, llmSpanStart, iteration, messages, resp, nil)
++		l.emitLLMSpan(ctx, llmSpanStart, iteration, usedModel, messages, resp, nil)
+ 
+ 		if resp.Usage != nil {
+ 			totalUsage.PromptTokens += resp.Usage.PromptTokens
+diff --git a/internal/agent/loop_tracing.go b/internal/agent/loop_tracing.go
+index f9ad103..1a5e5f6 100644
+--- a/internal/agent/loop_tracing.go
++++ b/internal/agent/loop_tracing.go
+@@ -33,23 +33,26 @@ func (l *Loop) IsRunning() bool { return l.activeRuns.Load() > 0 }
+ 
+ // emitLLMSpan records an LLM call span if tracing is active.
+ // When GOCLAW_TRACE_VERBOSE is set, messages are serialized as InputPreview.
+-func (l *Loop) emitLLMSpan(ctx context.Context, start time.Time, iteration int, messages []providers.Message, resp *providers.ChatResponse, callErr error) {
++func (l *Loop) emitLLMSpan(ctx context.Context, start time.Time, iteration int, model string, messages []providers.Message, resp *providers.ChatResponse, callErr error) {
+ 	traceID := tracing.TraceIDFromContext(ctx)
+ 	collector := tracing.CollectorFromContext(ctx)
+ 	if collector == nil || traceID == uuid.Nil {
+ 		return
+ 	}
++	if model == "" {
++		model = l.model
++	}
+ 
+ 	now := time.Now().UTC()
+ 	dur := int(now.Sub(start).Milliseconds())
+ 	span := store.SpanData{
+ 		TraceID:    traceID,
+ 		SpanType:   store.SpanTypeLLMCall,
+-		Name:       fmt.Sprintf("%s/%s #%d", l.provider.Name(), l.model, iteration),
++		Name:       fmt.Sprintf("%s/%s #%d", l.provider.Name(), model, iteration),
+ 		StartTime:  start,
+ 		EndTime:    &now,
+ 		DurationMS: dur,
+-		Model:      l.model,
++		Model:      model,
+ 		Provider:   l.provider.Name(),
+ 		Status:     store.SpanStatusCompleted,
+ 		Level:      store.SpanLevelDefault,
+diff --git a/internal/agent/resolver.go b/internal/agent/resolver.go
+index ec25353..cea0b60 100644
+--- a/internal/agent/resolver.go
++++ b/internal/agent/resolver.go
+@@ -21,13 +21,13 @@ import (
+ 
+ // ResolverDeps holds shared dependencies for the managed-mode agent resolver.
+ type ResolverDeps struct {
+-	AgentStore  store.AgentStore
+-	ProviderReg *providers.Registry
+-	Bus         bus.EventPublisher
+-	Sessions    store.SessionStore
+-	Tools       *tools.Registry
+-	ToolPolicy  *tools.PolicyEngine
+-	Skills      *skills.Loader
++	AgentStore     store.AgentStore
++	ProviderReg    *providers.Registry
++	Bus            bus.EventPublisher
++	Sessions       store.SessionStore
++	Tools          *tools.Registry
++	ToolPolicy     *tools.PolicyEngine
++	Skills         *skills.Loader
+ 	HasMemory      bool
+ 	OnEvent        func(AgentEvent)
+ 	TraceCollector *tracing.Collector
+@@ -257,28 +257,28 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
+ 		}
+ 
+ 		loop := NewLoop(LoopConfig{
+-			ID:                ag.AgentKey,
+-			AgentUUID:         ag.ID,
+-			AgentType:         ag.AgentType,
+-			Provider:          provider,
+-			Model:             ag.Model,
+-			ContextWindow:     contextWindow,
+-			MaxIterations:     maxIter,
+-			Workspace:         workspace,
+-			Bus:               deps.Bus,
+-			Sessions:          deps.Sessions,
+-			Tools:             toolsReg,
+-			ToolPolicy:        deps.ToolPolicy,
+-			AgentToolPolicy:   ag.ParseToolsConfig(),
+-			SkillsLoader:      deps.Skills,
+-			HasMemory:         hasMemory,
+-			ContextFiles:      contextFiles,
+-			EnsureUserFiles:   deps.EnsureUserFiles,
+-			ContextFileLoader: deps.ContextFileLoader,
+-			BootstrapCleanup:  deps.BootstrapCleanup,
+-			OnEvent:           deps.OnEvent,
+-			TraceCollector:    deps.TraceCollector,
+-			InjectionAction:   deps.InjectionAction,
++			ID:                     ag.AgentKey,
++			AgentUUID:              ag.ID,
++			AgentType:              ag.AgentType,
++			Provider:               provider,
++			Model:                  ag.Model,
++			ContextWindow:          contextWindow,
++			MaxIterations:          maxIter,
++			Workspace:              workspace,
++			Bus:                    deps.Bus,
++			Sessions:               deps.Sessions,
++			Tools:                  toolsReg,
++			ToolPolicy:             deps.ToolPolicy,
++			AgentToolPolicy:        ag.ParseToolsConfig(),
++			SkillsLoader:           deps.Skills,
++			HasMemory:              hasMemory,
++			ContextFiles:           contextFiles,
++			EnsureUserFiles:        deps.EnsureUserFiles,
++			ContextFileLoader:      deps.ContextFileLoader,
++			BootstrapCleanup:       deps.BootstrapCleanup,
++			OnEvent:                deps.OnEvent,
++			TraceCollector:         deps.TraceCollector,
++			InjectionAction:        deps.InjectionAction,
+ 			MaxMessageChars:        deps.MaxMessageChars,
+ 			CompactionCfg:          compactionCfg,
+ 			ContextPruningCfg:      contextPruningCfg,
+@@ -286,7 +286,8 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
+ 			SandboxContainerDir:    sandboxContainerDir,
+ 			SandboxWorkspaceAccess: sandboxWorkspaceAccess,
+ 			BuiltinToolSettings:    builtinSettings,
+-			ThinkingLevel:         ag.ParseThinkingLevel(),
++			ThinkingLevel:          ag.ParseThinkingLevel(),
++			ModelFallbacks:         ag.ParseModelFallbacks(),
+ 		})
+ 
+ 		slog.Info("resolved agent from DB", "agent", agentKey, "model", ag.Model, "provider", ag.Provider)
+diff --git a/internal/store/agent_store.go b/internal/store/agent_store.go
+index 1ec2168..7d7d267 100644
+--- a/internal/store/agent_store.go
++++ b/internal/store/agent_store.go
+@@ -3,6 +3,7 @@ package store
+ import (
+ 	"context"
+ 	"encoding/json"
++	"strings"
+ 
+ 	"github.com/google/uuid"
+ 	"github.com/nextlevelbuilder/goclaw/internal/config"
+@@ -16,9 +17,9 @@ const (
+ 
+ // Agent status constants.
+ const (
+-	AgentStatusActive      = "active"
+-	AgentStatusInactive    = "inactive"
+-	AgentStatusSummoning   = "summoning"
++	AgentStatusActive       = "active"
++	AgentStatusInactive     = "inactive"
++	AgentStatusSummoning    = "summoning"
+ 	AgentStatusSummonFailed = "summon_failed"
+ )
+ 
+@@ -136,6 +137,40 @@ func (a *AgentData) ParseThinkingLevel() string {
+ 	return cfg.ThinkingLevel
+ }
+ 
++// ParseModelFallbacks extracts model_fallbacks from other_config JSONB.
++// Returns nil if not configured.
++func (a *AgentData) ParseModelFallbacks() []string {
++	if len(a.OtherConfig) == 0 {
++		return nil
++	}
++	var cfg struct {
++		ModelFallbacks []string `json:"model_fallbacks"`
++	}
++	if json.Unmarshal(a.OtherConfig, &cfg) != nil {
++		return nil
++	}
++	if len(cfg.ModelFallbacks) == 0 {
++		return nil
++	}
++	out := make([]string, 0, len(cfg.ModelFallbacks))
++	seen := make(map[string]struct{}, len(cfg.ModelFallbacks))
++	for _, m := range cfg.ModelFallbacks {
++		model := strings.TrimSpace(m)
++		if model == "" {
++			continue
++		}
++		if _, ok := seen[model]; ok {
++			continue
++		}
++		seen[model] = struct{}{}
++		out = append(out, model)
++	}
++	if len(out) == 0 {
++		return nil
++	}
++	return out
++}
++
+ // AgentShareData represents an agent share grant.
+ type AgentShareData struct {
+ 	BaseModel
+diff --git a/internal/agent/loop_fallback_test.go b/internal/agent/loop_fallback_test.go
+new file mode 100644
+index 0000000..0f71b01
+--- /dev/null
++++ b/internal/agent/loop_fallback_test.go
+@@ -0,0 +1,107 @@
++package agent
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"testing"
++
++	"github.com/nextlevelbuilder/goclaw/internal/providers"
++)
++
++type scriptedProvider struct {
++	calls       []string
++	failByModel map[string]error
++}
++
++func (p *scriptedProvider) Chat(_ context.Context, req providers.ChatRequest) (*providers.ChatResponse, error) {
++	p.calls = append(p.calls, req.Model)
++	if err, ok := p.failByModel[req.Model]; ok {
++		return nil, err
++	}
++	return &providers.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
++}
++
++func (p *scriptedProvider) ChatStream(ctx context.Context, req providers.ChatRequest, onChunk func(providers.StreamChunk)) (*providers.ChatResponse, error) {
++	resp, err := p.Chat(ctx, req)
++	if err != nil {
++		return nil, err
++	}
++	if onChunk != nil {
++		onChunk(providers.StreamChunk{Content: resp.Content})
++		onChunk(providers.StreamChunk{Done: true})
++	}
++	return resp, nil
++}
++
++func (p *scriptedProvider) DefaultModel() string { return "" }
++func (p *scriptedProvider) Name() string         { return "openrouter" }
++
++func TestCallProviderWithFallback_OnRateLimitUsesNextModel(t *testing.T) {
++	prov := &scriptedProvider{failByModel: map[string]error{
++		"m1": &providers.HTTPError{Status: 429, Body: "rate limit"},
++	}}
++	loop := &Loop{
++		id:             "router-agent",
++		provider:       prov,
++		model:          "m1",
++		modelFallbacks: []string{"m2"},
++	}
++
++	resp, usedModel, err := loop.callProviderWithFallback(context.Background(), providers.ChatRequest{Model: "m1"}, false, nil)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if usedModel != "m2" {
++		t.Fatalf("usedModel = %q, want %q", usedModel, "m2")
++	}
++	if resp == nil || resp.Content != "ok" {
++		t.Fatalf("unexpected response: %#v", resp)
++	}
++	wantCalls := []string{"m1", "m2"}
++	if !reflect.DeepEqual(prov.calls, wantCalls) {
++		t.Fatalf("calls = %#v, want %#v", prov.calls, wantCalls)
++	}
++}
++
++func TestCallProviderWithFallback_NonRateLimitDoesNotFallback(t *testing.T) {
++	prov := &scriptedProvider{failByModel: map[string]error{
++		"m1": &providers.HTTPError{Status: 400, Body: "bad request"},
++	}}
++	loop := &Loop{
++		id:             "router-agent",
++		provider:       prov,
++		model:          "m1",
++		modelFallbacks: []string{"m2"},
++	}
++
++	_, usedModel, err := loop.callProviderWithFallback(context.Background(), providers.ChatRequest{Model: "m1"}, false, nil)
++	if err == nil {
++		t.Fatal("expected error, got nil")
++	}
++	if usedModel != "m1" {
++		t.Fatalf("usedModel = %q, want %q", usedModel, "m1")
++	}
++	wantCalls := []string{"m1"}
++	if !reflect.DeepEqual(prov.calls, wantCalls) {
++		t.Fatalf("calls = %#v, want %#v", prov.calls, wantCalls)
++	}
++}
++
++func TestModelCandidates_DedupesAndKeepsOrder(t *testing.T) {
++	loop := &Loop{
++		modelFallbacks: []string{"m1", "", "m2", "m2", "m3"},
++	}
++	got := loop.modelCandidates("m1")
++	want := []string{"m1", "m2", "m3"}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("candidates = %#v, want %#v", got, want)
++	}
++}
++
++func TestIsRateLimitFailure_RecognizesWrappedHTTP429(t *testing.T) {
++	err := errors.New("wrapper: " + (&providers.HTTPError{Status: 429, Body: "too many requests"}).Error())
++	if !isRateLimitFailure(err) {
++		t.Fatal("expected wrapped 429-like error to be treated as rate-limit")
++	}
++}

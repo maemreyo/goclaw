@@ -1,0 +1,272 @@
+diff --git a/internal/channels/telegram/channel.go b/internal/channels/telegram/channel.go
+index 2ff33a1..aa8a8c5 100644
+--- a/internal/channels/telegram/channel.go
++++ b/internal/channels/telegram/channel.go
+@@ -34,11 +34,12 @@ type Channel struct {
+ 	pairingReplySent sync.Map         // userID string → time.Time (debounce pairing replies)
+ 	threadIDs        sync.Map         // localKey string → messageThreadID int (for forum topic routing)
+ 	approvedGroups   sync.Map         // chatIDStr string → true (cached group pairing approval)
++	dmAgentAffinity  sync.Map         // chatIDStr string → dmAffinity (sticky DM route)
+ 	groupHistory     *channels.PendingHistory
+ 	historyLimit     int
+ 	requireMention   bool
+ 	pollCancel       context.CancelFunc // cancels the long polling context
+-	pollDone         chan struct{}       // closed when polling goroutine exits
++	pollDone         chan struct{}      // closed when polling goroutine exits
+ }
+ 
+ type thinkingCancel struct {
+diff --git a/internal/channels/telegram/factory.go b/internal/channels/telegram/factory.go
+index a8b5698..7c14068 100644
+--- a/internal/channels/telegram/factory.go
++++ b/internal/channels/telegram/factory.go
+@@ -27,6 +27,11 @@ type telegramInstanceConfig struct {
+ 	MediaMaxBytes  int64    `json:"media_max_bytes,omitempty"`
+ 	LinkPreview    *bool    `json:"link_preview,omitempty"`
+ 	AllowFrom      []string `json:"allow_from,omitempty"`
++	STTProxyURL    string   `json:"stt_proxy_url,omitempty"`
++	STTAPIKey      string   `json:"stt_api_key,omitempty"`
++	STTTenantID    string   `json:"stt_tenant_id,omitempty"`
++	STTTimeoutSec  int      `json:"stt_timeout_seconds,omitempty"`
++	VoiceAgentID   string   `json:"voice_agent_id,omitempty"`
+ }
+ 
+ // Factory creates a Telegram channel from DB instance data (no agent/team store).
+@@ -65,18 +70,23 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
+ 	}
+ 
+ 	tgCfg := config.TelegramConfig{
+-		Enabled:        true,
+-		Token:          c.Token,
+-		Proxy:          c.Proxy,
+-		AllowFrom:      ic.AllowFrom,
+-		DMPolicy:       ic.DMPolicy,
+-		GroupPolicy:    ic.GroupPolicy,
+-		RequireMention: ic.RequireMention,
+-		HistoryLimit:   ic.HistoryLimit,
+-		StreamMode:     ic.StreamMode,
+-		ReactionLevel:  ic.ReactionLevel,
+-		MediaMaxBytes:  ic.MediaMaxBytes,
+-		LinkPreview:    ic.LinkPreview,
++		Enabled:           true,
++		Token:             c.Token,
++		Proxy:             c.Proxy,
++		AllowFrom:         ic.AllowFrom,
++		DMPolicy:          ic.DMPolicy,
++		GroupPolicy:       ic.GroupPolicy,
++		RequireMention:    ic.RequireMention,
++		HistoryLimit:      ic.HistoryLimit,
++		StreamMode:        ic.StreamMode,
++		ReactionLevel:     ic.ReactionLevel,
++		MediaMaxBytes:     ic.MediaMaxBytes,
++		LinkPreview:       ic.LinkPreview,
++		STTProxyURL:       ic.STTProxyURL,
++		STTAPIKey:         ic.STTAPIKey,
++		STTTenantID:       ic.STTTenantID,
++		STTTimeoutSeconds: ic.STTTimeoutSec,
++		VoiceAgentID:      ic.VoiceAgentID,
+ 	}
+ 
+ 	// DB instances default to "pairing" for groups (secure by default).
+diff --git a/internal/channels/telegram/handlers.go b/internal/channels/telegram/handlers.go
+index 381d8e3..0e55223 100644
+--- a/internal/channels/telegram/handlers.go
++++ b/internal/channels/telegram/handlers.go
+@@ -15,6 +15,13 @@ import (
+ 	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
+ )
+ 
++const dmAffinityTTL = 6 * time.Hour
++
++type dmAffinity struct {
++	AgentID   string
++	UpdatedAt time.Time
++}
++
+ // handleMessage processes an incoming Telegram update.
+ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
+ 	message := update.Message
+@@ -181,6 +188,11 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
+ 					)
+ 				} else {
+ 					m.Transcript = transcript
++					if transcript != "" {
++						slog.Info("telegram: transcript attached to inbound media",
++							"type", m.Type, "chars", len(transcript),
++						)
++					}
+ 				}
+ 
+ 			case "document":
+@@ -379,15 +391,59 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
+ 	// This prevents voice turns from landing on a text-router agent that cannot handle audio.
+ 	targetAgentID := c.AgentID()
+ 	if c.config.VoiceAgentID != "" {
++		routeReason := ""
+ 		for _, m := range mediaList {
+ 			if m.Type == "audio" || m.Type == "voice" {
+ 				targetAgentID = c.config.VoiceAgentID
+-				slog.Debug("telegram: routing voice inbound to speaking agent",
+-					"agent_id", targetAgentID, "media_type", m.Type,
+-				)
++				routeReason = "audio_media"
+ 				break
+ 			}
+ 		}
++
++		if routeReason == "" && !isGroup {
++			normalized := strings.ToLower(strings.TrimSpace(content))
++			switch {
++			case normalized == "/start" || normalized == "start":
++				targetAgentID = c.config.VoiceAgentID
++				routeReason = "start_command"
++				// Normalize /start into an explicit learning intent for speaking-agent.
++				finalContent = "Bắt đầu buổi luyện speaking hôm nay. User vừa gửi lệnh /start."
++			case looksLikeSpeakingIntent(normalized):
++				targetAgentID = c.config.VoiceAgentID
++				routeReason = "speaking_intent"
++			}
++
++			if routeReason == "" {
++				if looksLikeNonSpeakingIntent(normalized) {
++					c.dmAgentAffinity.Delete(chatIDStr)
++					slog.Info("telegram: cleared DM affinity due to non-speaking intent", "chat_id", chatIDStr)
++				} else if v, ok := c.dmAgentAffinity.Load(chatIDStr); ok {
++					if affinity, ok := v.(dmAffinity); ok {
++						if time.Since(affinity.UpdatedAt) <= dmAffinityTTL && affinity.AgentID != "" {
++							targetAgentID = affinity.AgentID
++							routeReason = "session_affinity"
++						} else {
++							c.dmAgentAffinity.Delete(chatIDStr)
++						}
++					}
++				}
++			}
++		}
++
++		if routeReason == "audio_media" || routeReason == "start_command" || routeReason == "speaking_intent" || routeReason == "session_affinity" {
++			c.dmAgentAffinity.Store(chatIDStr, dmAffinity{
++				AgentID:   c.config.VoiceAgentID,
++				UpdatedAt: time.Now(),
++			})
++		}
++
++		if routeReason != "" {
++			slog.Info("telegram: routing inbound to dedicated speaking agent",
++				"agent_id", targetAgentID,
++				"reason", routeReason,
++				"peer_kind", peerKind,
++			)
++		}
+ 	}
+ 
+ 	c.Bus().PublishInbound(bus.InboundMessage{
+@@ -409,6 +465,61 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
+ 	}
+ }
+ 
++func looksLikeSpeakingIntent(normalized string) bool {
++	if normalized == "" {
++		return false
++	}
++
++	keywords := []string{
++		"speaking",
++		"luyen noi",
++		"luyện nói",
++		"luyen speaking",
++		"hoc speaking",
++		"học speaking",
++		"do you prefer",
++		"pronunciation",
++		"phat am",
++		"phát âm",
++		"ielts part 1",
++		"ielts part 2",
++		"ielts part 3",
++	}
++
++	for _, kw := range keywords {
++		if strings.Contains(normalized, kw) {
++			return true
++		}
++	}
++	return false
++}
++
++func looksLikeNonSpeakingIntent(normalized string) bool {
++	if normalized == "" {
++		return false
++	}
++
++	keywords := []string{
++		// Finance
++		"học phí", "hoc phi", "đóng tiền", "dong tien", "payment", "invoice", "công nợ", "cong no",
++		// Homework
++		"bài tập", "bai tap", "homework", "nộp bài", "nop bai", "deadline",
++		// Schedule
++		"lịch", "lich", "schedule", "xin nghỉ", "xin nghi", "nghỉ học", "nghi hoc", "lịch bù", "lich bu", "makeup",
++		// Admissions
++		"khóa học", "khoa hoc", "đăng ký", "dang ky", "tư vấn", "tu van", "học thử", "hoc thu", "course info",
++		// Writing
++		"writing", "essay", "chấm bài", "cham bai", "task 1", "task 2",
++	}
++
++	for _, kw := range keywords {
++		if strings.Contains(normalized, kw) {
++			return true
++		}
++	}
++	return false
++}
++
+ // detectMention checks if a Telegram message mentions the bot.
+ // Checks both msg.Text/Entities (text messages) and msg.Caption/CaptionEntities (photo/media messages).
+ func (c *Channel) detectMention(msg *telego.Message, botUsername string) bool {
+diff --git a/internal/channels/telegram/stt.go b/internal/channels/telegram/stt.go
+index ef6bd09..2bdf188 100644
+--- a/internal/channels/telegram/stt.go
++++ b/internal/channels/telegram/stt.go
+@@ -11,6 +11,7 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -86,7 +87,11 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
+ 	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+ 	defer cancel()
+ 
+-	url := c.config.STTProxyURL + sttTranscribeEndpoint
++	baseURL := strings.TrimRight(strings.TrimSpace(c.config.STTProxyURL), "/")
++	url := baseURL
++	if !strings.HasSuffix(baseURL, sttTranscribeEndpoint) {
++		url = baseURL + sttTranscribeEndpoint
++	}
+ 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, &body)
+ 	if err != nil {
+ 		return "", fmt.Errorf("stt: build request to %q: %w", url, err)
+@@ -119,15 +124,12 @@ func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string,
+ 		return "", fmt.Errorf("stt: parse response JSON: %w", err)
+ 	}
+ 
+-	slog.Debug("telegram: STT transcript received",
+-		"length", len(result.Transcript),
+-		"preview", func() string {
+-			if len(result.Transcript) > 80 {
+-				return result.Transcript[:80] + "..."
+-			}
+-			return result.Transcript
+-		}(),
+-	)
++	if result.Transcript == "" {
++		slog.Warn("telegram: STT transcript empty", "url", url)
++		return "", nil
++	}
++
++	slog.Info("telegram: STT transcript received", "length", len(result.Transcript))
+ 
+ 	return result.Transcript, nil
+ }
