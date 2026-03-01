@@ -176,6 +176,63 @@ func TestSanitize_MediaAudioTag(t *testing.T) {
 	}
 }
 
+// TestSanitize_ErrorWithTranscript_CustomFallbackNoPlaceholder verifies that a
+// custom fallback template WITHOUT a %s placeholder does NOT produce
+// "%!(EXTRA string=...)" garbage. The transcript is silently omitted but the
+// student receives a clean message.
+func TestSanitize_ErrorWithTranscript_CustomFallbackNoPlaceholder(t *testing.T) {
+	// Operator set a clean message with no %s — common mistake.
+	customTpl := "Please resend your voice note, there was a small hiccup!"
+	tgCfg := newTgCfg(testVoiceAgent, customTpl, "")
+	inbound := `<media:voice><transcript>hello world</transcript></media:voice>`
+	reply := "system error: tool execution failed"
+
+	got := sanitizeVoiceAgentReply(testVoiceAgent, testVoiceAgent, "telegram", dmPeer, inbound, reply, tgCfg)
+
+	// Must be exactly the template string — no %!(EXTRA...) suffix appended.
+	if got != customTpl {
+		t.Errorf("expected clean fallback %q, got %q", customTpl, got)
+	}
+	// Explicit check: fmt.Sprintf leakage looks like "%!(EXTRA".
+	if strings.Contains(got, "%!") {
+		t.Errorf("fmt.Sprintf garbage leaked into output: %q", got)
+	}
+}
+
+// TestSanitize_ErrorWithTranscript_CustomFallbackWithPlaceholder verifies that
+// a custom template WITH %s correctly inlines the transcript.
+func TestSanitize_ErrorWithTranscript_CustomFallbackWithPlaceholder(t *testing.T) {
+	customTpl := `Mình nghe: "%s" — gửi lại nhé!`
+	tgCfg := newTgCfg(testVoiceAgent, customTpl, "")
+	inbound := `<media:voice><transcript>xin chào</transcript></media:voice>`
+	reply := "exit status 1"
+
+	got := sanitizeVoiceAgentReply(testVoiceAgent, testVoiceAgent, "telegram", dmPeer, inbound, reply, tgCfg)
+	want := `Mình nghe: "xin chào" — gửi lại nhé!`
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
+	}
+}
+
+// TestSanitize_ErrorWithTranscript_DefaultFallbackNoFmtGarbage verifies that
+// the built-in default also inlines transcript cleanly after switching from
+// fmt.Sprintf to strings.ReplaceAll.
+func TestSanitize_ErrorWithTranscript_DefaultFallbackNoFmtGarbage(t *testing.T) {
+	tgCfg := newTgCfg(testVoiceAgent, "", "")
+	transcript := "I wake up at 7am every day"
+	inbound := "<media:voice><transcript>" + transcript + "</transcript></media:voice>"
+	reply := "tool error: evaluation failed"
+
+	got := sanitizeVoiceAgentReply(testVoiceAgent, testVoiceAgent, "telegram", dmPeer, inbound, reply, tgCfg)
+
+	if strings.Contains(got, "%!") {
+		t.Errorf("fmt.Sprintf garbage in default fallback: %q", got)
+	}
+	if !strings.Contains(got, transcript) {
+		t.Errorf("expected transcript %q in fallback, got: %q", transcript, got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // containsTechnicalErrorLanguage
 // ---------------------------------------------------------------------------

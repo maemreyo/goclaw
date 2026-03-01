@@ -46,12 +46,34 @@ func TestMatchesVoiceIntent_Matches(t *testing.T) {
 		"i want to practice speaking",
 		"help with pronunciation please",
 		"ielts part 1 question",
-		"SPEAKING",    // already lowercased by caller before matchesVoiceIntent
+		"speaking", // note: caller always calls strings.ToLower before matchesVoiceIntent
 		"pronunciation coach",
 	}
 	for _, s := range cases {
 		if !c.matchesVoiceIntent(s) {
 			t.Errorf("expected true for %q, got false", s)
+		}
+	}
+}
+
+// TestMatchesVoiceIntent_MixedCaseKeywords verifies that config keywords stored
+// with mixed case (e.g. from a DB that does not normalise on write) still match
+// lowercase inbound text. This exercises the strings.ToLower(kw) defensive path
+// added to matchesVoiceIntent.
+func TestMatchesVoiceIntent_MixedCaseKeywords(t *testing.T) {
+	c := newChannelForRouting(config.TelegramConfig{
+		// Keywords intentionally stored with mixed case, as a careless operator might do.
+		VoiceIntentKeywords: []string{"Speaking", "PRONUNCIATION", "Ielts Part"},
+	})
+	// Inbound text is always lowercased by the caller (handlers.go strings.ToLower).
+	cases := []string{
+		"i want to practice speaking",
+		"help with pronunciation please",
+		"ielts part 1 question",
+	}
+	for _, s := range cases {
+		if !c.matchesVoiceIntent(s) {
+			t.Errorf("mixed-case keyword: expected true for %q, got false", s)
 		}
 	}
 }
@@ -125,6 +147,24 @@ func TestMatchesAffinityClear_NoMatch(t *testing.T) {
 	for _, s := range cases {
 		if c.matchesAffinityClear(s) {
 			t.Errorf("expected false for %q, got true", s)
+		}
+	}
+}
+
+// TestMatchesAffinityClear_MixedCaseKeywords mirrors TestMatchesVoiceIntent_MixedCaseKeywords
+// for the affinity-clear path.
+func TestMatchesAffinityClear_MixedCaseKeywords(t *testing.T) {
+	c := newChannelForRouting(config.TelegramConfig{
+		VoiceAffinityClearKeywords: []string{"Homework", "PAYMENT", "Schedule"},
+	})
+	cases := []string{
+		"i have a homework question",
+		"payment due date",
+		"what is my schedule today",
+	}
+	for _, s := range cases {
+		if !c.matchesAffinityClear(s) {
+			t.Errorf("mixed-case keyword: expected true for %q, got false", s)
 		}
 	}
 }

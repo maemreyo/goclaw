@@ -112,8 +112,11 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_DISCORD_TOKEN", &c.Channels.Discord.Token)
 	envStr("GOCLAW_ZALO_TOKEN", &c.Channels.Zalo.Token)
 	// STT and voice-agent runtime overrides — let operators set these without editing config.json.
+	envStr("GOCLAW_VOICE_AGENT_ID", &c.Channels.Telegram.VoiceAgentID)
 	envStr("GOCLAW_STT_TENANT_ID", &c.Channels.Telegram.STTTenantID)
 	envStr("GOCLAW_VOICE_DM_CONTEXT_TEMPLATE", &c.Channels.Telegram.VoiceDMContextTemplate)
+	envStr("GOCLAW_AUDIO_GUARD_FALLBACK_TRANSCRIPT", &c.Channels.Telegram.AudioGuardFallbackTranscript)
+	envStr("GOCLAW_AUDIO_GUARD_FALLBACK_NO_TRANSCRIPT", &c.Channels.Telegram.AudioGuardFallbackNoTranscript)
 	envStr("GOCLAW_LARK_APP_ID", &c.Channels.Feishu.AppID)
 	envStr("GOCLAW_LARK_APP_SECRET", &c.Channels.Feishu.AppSecret)
 	envStr("GOCLAW_LARK_ENCRYPT_KEY", &c.Channels.Feishu.EncryptKey)

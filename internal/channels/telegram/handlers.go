@@ -485,8 +485,10 @@ func (c *Channel) matchesVoiceIntent(normalized string) bool {
 	if len(c.config.VoiceIntentKeywords) == 0 || normalized == "" {
 		return false
 	}
+	// Lowercase each keyword defensively: the caller already lowercases the
+	// inbound text, but config keywords may arrive with mixed case from DB.
 	for _, kw := range c.config.VoiceIntentKeywords {
-		if strings.Contains(normalized, kw) {
+		if strings.Contains(normalized, strings.ToLower(kw)) {
 			return true
 		}
 	}
@@ -500,8 +502,10 @@ func (c *Channel) matchesAffinityClear(normalized string) bool {
 	if len(c.config.VoiceAffinityClearKeywords) == 0 || normalized == "" {
 		return false
 	}
+	// Lowercase each keyword defensively: the caller already lowercases the
+	// inbound text, but config keywords may arrive with mixed case from DB.
 	for _, kw := range c.config.VoiceAffinityClearKeywords {
-		if strings.Contains(normalized, kw) {
+		if strings.Contains(normalized, strings.ToLower(kw)) {
 			return true
 		}
 	}

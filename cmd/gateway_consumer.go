@@ -723,7 +723,10 @@ func sanitizeVoiceAgentReply(voiceAgentID, agentID, channel, peerKind, inboundCo
 		if tpl == "" {
 			tpl = defaultAudioFallbackTranscript
 		}
-		return fmt.Sprintf(tpl, transcript)
+		// Use strings.ReplaceAll instead of fmt.Sprintf so that custom templates
+		// without a %s placeholder don't produce %!(EXTRA string=...) garbage.
+		// The built-in default always contains %s; custom deployments may omit it.
+		return strings.ReplaceAll(tpl, "%s", transcript)
 	}
 
 	msg := tgCfg.AudioGuardFallbackNoTranscript
