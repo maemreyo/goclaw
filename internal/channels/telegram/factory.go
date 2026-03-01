@@ -17,28 +17,40 @@ type telegramCreds struct {
 }
 
 // telegramInstanceConfig maps the non-secret config JSONB from the channel_instances table.
+// It supports two JSON layouts for voice settings:
+//   - Nested (preferred for new rows):  {"voice": {"agent_id": "speaking-agent", ...}}
+//   - Flat  (legacy, still accepted):   {"voice_agent_id": "speaking-agent", ...}
+//
+// buildChannel promotes flat fields into the nested Voice struct when Voice.AgentID is empty,
+// so existing DB rows continue to work without migration.
 type telegramInstanceConfig struct {
-	DMPolicy                       string   `json:"dm_policy,omitempty"`
-	GroupPolicy                    string   `json:"group_policy,omitempty"`
-	RequireMention                 *bool    `json:"require_mention,omitempty"`
-	HistoryLimit                   int      `json:"history_limit,omitempty"`
-	StreamMode                     string   `json:"stream_mode,omitempty"`
-	ReactionLevel                  string   `json:"reaction_level,omitempty"`
-	MediaMaxBytes                  int64    `json:"media_max_bytes,omitempty"`
-	LinkPreview                    *bool    `json:"link_preview,omitempty"`
-	AllowFrom                      []string `json:"allow_from,omitempty"`
-	STTProxyURL                    string   `json:"stt_proxy_url,omitempty"`
-	STTAPIKey                      string   `json:"stt_api_key,omitempty"`
-	STTTenantID                    string   `json:"stt_tenant_id,omitempty"`
-	STTTimeoutSec                  int      `json:"stt_timeout_seconds,omitempty"`
-	VoiceAgentID                   string   `json:"voice_agent_id,omitempty"`
-	VoiceStartMessage              string   `json:"voice_start_message,omitempty"`
-	VoiceIntentKeywords            []string `json:"voice_intent_keywords,omitempty"`
-	VoiceAffinityClearKeywords     []string `json:"voice_affinity_clear_keywords,omitempty"`
-	VoiceAffinityTTLMinutes        int      `json:"voice_affinity_ttl_minutes,omitempty"`
-	VoiceDMContextTemplate         string   `json:"voice_dm_context_template,omitempty"`
-	AudioGuardFallbackTranscript   string   `json:"audio_guard_fallback_transcript,omitempty"`
-	AudioGuardFallbackNoTranscript string   `json:"audio_guard_fallback_no_transcript,omitempty"`
+	DMPolicy       string   `json:"dm_policy,omitempty"`
+	GroupPolicy    string   `json:"group_policy,omitempty"`
+	RequireMention *bool    `json:"require_mention,omitempty"`
+	HistoryLimit   int      `json:"history_limit,omitempty"`
+	StreamMode     string   `json:"stream_mode,omitempty"`
+	ReactionLevel  string   `json:"reaction_level,omitempty"`
+	MediaMaxBytes  int64    `json:"media_max_bytes,omitempty"`
+	LinkPreview    *bool    `json:"link_preview,omitempty"`
+	AllowFrom      []string `json:"allow_from,omitempty"`
+
+	// Nested voice config — preferred layout for new DB rows.
+	Voice config.TelegramVoiceConfig `json:"voice,omitempty"`
+
+	// Legacy flat fields — populated by older DB rows.
+	// buildChannel promotes these into Voice when Voice.AgentID is empty.
+	LegacySTTProxyURL                    string   `json:"stt_proxy_url,omitempty"`
+	LegacySTTAPIKey                      string   `json:"stt_api_key,omitempty"`
+	LegacySTTTenantID                    string   `json:"stt_tenant_id,omitempty"`
+	LegacySTTTimeoutSec                  int      `json:"stt_timeout_seconds,omitempty"`
+	LegacyVoiceAgentID                   string   `json:"voice_agent_id,omitempty"`
+	LegacyVoiceStartMessage              string   `json:"voice_start_message,omitempty"`
+	LegacyVoiceIntentKeywords            []string `json:"voice_intent_keywords,omitempty"`
+	LegacyVoiceAffinityClearKeywords     []string `json:"voice_affinity_clear_keywords,omitempty"`
+	LegacyVoiceAffinityTTLMinutes        int      `json:"voice_affinity_ttl_minutes,omitempty"`
+	LegacyVoiceDMContextTemplate         string   `json:"voice_dm_context_template,omitempty"`
+	LegacyAudioGuardFallbackTranscript   string   `json:"audio_guard_fallback_transcript,omitempty"`
+	LegacyAudioGuardFallbackNoTranscript string   `json:"audio_guard_fallback_no_transcript,omitempty"`
 }
 
 // Factory creates a Telegram channel from DB instance data (no agent/team store).
@@ -76,31 +88,48 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 		}
 	}
 
+	// Resolve voice config: prefer the nested "voice" block.
+	// When absent, promote flat legacy fields so existing DB rows need no migration.
+	//
+	// IMPORTANT — legacy promotion is all-or-nothing:
+	// if Voice.AgentID is already set in the nested block, we assume the row
+	// has been fully migrated and skip ALL flat fields.  Partial migrations
+	// (nested AgentID + flat keywords) are not supported.  Migrate all voice
+	// fields to the nested block in one atomic DB update.
+	voiceCfg := ic.Voice
+	if voiceCfg.AgentID == "" && ic.LegacyVoiceAgentID != "" {
+		// Promote all flat voice fields as a unit (all-or-nothing).
+		voiceCfg.AgentID = ic.LegacyVoiceAgentID
+		voiceCfg.StartMessage = ic.LegacyVoiceStartMessage
+		voiceCfg.IntentKeywords = ic.LegacyVoiceIntentKeywords
+		voiceCfg.AffinityClearKeywords = ic.LegacyVoiceAffinityClearKeywords
+		voiceCfg.AffinityTTLMinutes = ic.LegacyVoiceAffinityTTLMinutes
+		voiceCfg.DMContextTemplate = ic.LegacyVoiceDMContextTemplate
+		voiceCfg.AudioGuardFallbackTranscript = ic.LegacyAudioGuardFallbackTranscript
+		voiceCfg.AudioGuardFallbackNoTranscript = ic.LegacyAudioGuardFallbackNoTranscript
+	}
+	// STT fields are batched together: if no URL, the other STT fields are meaningless.
+	if voiceCfg.STTProxyURL == "" && ic.LegacySTTProxyURL != "" {
+		voiceCfg.STTProxyURL = ic.LegacySTTProxyURL
+		voiceCfg.STTAPIKey = ic.LegacySTTAPIKey
+		voiceCfg.STTTenantID = ic.LegacySTTTenantID
+		voiceCfg.STTTimeoutSeconds = ic.LegacySTTTimeoutSec
+	}
+
 	tgCfg := config.TelegramConfig{
-		Enabled:                        true,
-		Token:                          c.Token,
-		Proxy:                          c.Proxy,
-		AllowFrom:                      ic.AllowFrom,
-		DMPolicy:                       ic.DMPolicy,
-		GroupPolicy:                    ic.GroupPolicy,
-		RequireMention:                 ic.RequireMention,
-		HistoryLimit:                   ic.HistoryLimit,
-		StreamMode:                     ic.StreamMode,
-		ReactionLevel:                  ic.ReactionLevel,
-		MediaMaxBytes:                  ic.MediaMaxBytes,
-		LinkPreview:                    ic.LinkPreview,
-		STTProxyURL:                    ic.STTProxyURL,
-		STTAPIKey:                      ic.STTAPIKey,
-		STTTenantID:                    ic.STTTenantID,
-		STTTimeoutSeconds:              ic.STTTimeoutSec,
-		VoiceAgentID:                   ic.VoiceAgentID,
-		VoiceStartMessage:              ic.VoiceStartMessage,
-		VoiceIntentKeywords:            ic.VoiceIntentKeywords,
-		VoiceAffinityClearKeywords:     ic.VoiceAffinityClearKeywords,
-		VoiceAffinityTTLMinutes:        ic.VoiceAffinityTTLMinutes,
-		VoiceDMContextTemplate:         ic.VoiceDMContextTemplate,
-		AudioGuardFallbackTranscript:   ic.AudioGuardFallbackTranscript,
-		AudioGuardFallbackNoTranscript: ic.AudioGuardFallbackNoTranscript,
+		Enabled:        true,
+		Token:          c.Token,
+		Proxy:          c.Proxy,
+		AllowFrom:      ic.AllowFrom,
+		DMPolicy:       ic.DMPolicy,
+		GroupPolicy:    ic.GroupPolicy,
+		RequireMention: ic.RequireMention,
+		HistoryLimit:   ic.HistoryLimit,
+		StreamMode:     ic.StreamMode,
+		ReactionLevel:  ic.ReactionLevel,
+		MediaMaxBytes:  ic.MediaMaxBytes,
+		LinkPreview:    ic.LinkPreview,
+		Voice:          voiceCfg,
 	}
 
 	// DB instances default to "pairing" for groups (secure by default).

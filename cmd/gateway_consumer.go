@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"html"
 	"log/slog"
-	"regexp"
 	"strings"
 	"time"
 
@@ -15,6 +13,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram/voiceguard"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/sessions"
@@ -153,8 +152,8 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				"- Keep responses concise and focused; long replies are disruptive in groups.\n" +
 				"- Address the group naturally. If the history shows a multi-person conversation, consider the full context before answering."
 		}
-		if agentID == cfg.Channels.Telegram.VoiceAgentID && cfg.Channels.Telegram.VoiceAgentID != "" && peerKind == string(sessions.PeerDirect) {
-			if tmpl := cfg.Channels.Telegram.VoiceDMContextTemplate; tmpl != "" {
+		if agentID == cfg.Channels.Telegram.Voice.AgentID && cfg.Channels.Telegram.Voice.AgentID != "" && peerKind == string(sessions.PeerDirect) {
+			if tmpl := cfg.Channels.Telegram.Voice.DMContextTemplate; tmpl != "" {
 				// Substitute {user_id} — the only runtime value the gateway knows.
 				// All other deployment-specific values (e.g. tenant_id) are baked into the template.
 				voiceCtx := strings.ReplaceAll(tmpl, "{user_id}", userID)
@@ -256,7 +255,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			}
 
 			replyContent := outcome.Result.Content
-			replyContent = sanitizeVoiceAgentReply(cfg.Channels.Telegram.VoiceAgentID, agentKey, channel, peer, originalContent, replyContent, cfg.Channels.Telegram)
+			replyContent = voiceguard.SanitizeReply(cfg.Channels.Telegram.Voice.AgentID, agentKey, channel, peer, originalContent, replyContent, cfg.Channels.Telegram.Voice)
 
 			// Publish response back to the channel
 			outMsg := bus.OutboundMessage{
@@ -685,90 +684,6 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 	}
 }
 
-var transcriptTagRe = regexp.MustCompile(`(?s)<transcript>(.*?)</transcript>`)
-
-// defaultAudioFallbackTranscript is the generic fallback sent when a voice-agent DM reply
-// contains technical error language and a transcript is available (%s = transcript text).
-const defaultAudioFallbackTranscript = "🎙️ Got your voice message! I heard: \"%s\"\n\n" +
-	"There was a brief hiccup on my end — please send your response again and I'll review it straight away."
-
-// defaultAudioFallbackNoTranscript is the generic fallback when no transcript is available.
-const defaultAudioFallbackNoTranscript = "🎙️ Got your voice message!\n\n" +
-	"I had a little trouble processing it — could you send it again or type your response? I'll get back to you right away."
-
-// sanitizeVoiceAgentReply intercepts replies from the configured voice agent on Telegram DMs.
-// When the agent's reply contains technical error language AND the inbound message contained
-// an audio/voice tag, the reply is replaced with a user-friendly coaching fallback so that
-// internal errors (exit status, rate limit, tool failures, etc.) are never exposed to the user.
-//
-// voiceAgentID is cfg.Channels.Telegram.VoiceAgentID.
-// tgCfg is the Telegram channel config (provides optional custom fallback strings).
-func sanitizeVoiceAgentReply(voiceAgentID, agentID, channel, peerKind, inboundContent, reply string, tgCfg config.TelegramConfig) string {
-	if voiceAgentID == "" || agentID != voiceAgentID {
-		return reply
-	}
-	if channel != "telegram" || peerKind != string(sessions.PeerDirect) {
-		return reply
-	}
-	if !strings.Contains(inboundContent, "<media:voice>") && !strings.Contains(inboundContent, "<media:audio>") {
-		return reply
-	}
-	if !containsTechnicalErrorLanguage(reply) {
-		return reply
-	}
-
-	transcript := extractTranscriptFromInbound(inboundContent)
-	if transcript != "" {
-		tpl := tgCfg.AudioGuardFallbackTranscript
-		if tpl == "" {
-			tpl = defaultAudioFallbackTranscript
-		}
-		// Use strings.ReplaceAll instead of fmt.Sprintf so that custom templates
-		// without a %s placeholder don't produce %!(EXTRA string=...) garbage.
-		// The built-in default always contains %s; custom deployments may omit it.
-		return strings.ReplaceAll(tpl, "%s", transcript)
-	}
-
-	msg := tgCfg.AudioGuardFallbackNoTranscript
-	if msg == "" {
-		msg = defaultAudioFallbackNoTranscript
-	}
-	return msg
-}
-
-func containsTechnicalErrorLanguage(s string) bool {
-	lower := strings.ToLower(strings.TrimSpace(s))
-	if lower == "" {
-		return false
-	}
-	for _, marker := range []string{
-		"vấn đề kỹ thuật",
-		"vấn đề hệ thống",
-		"lỗi hệ thống",
-		"technical issue",
-		"system error",
-		"exit status",
-		"rate limit",
-		"api rate limit",
-		"tool error",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func extractTranscriptFromInbound(content string) string {
-	m := transcriptTagRe.FindStringSubmatch(content)
-	if len(m) < 2 {
-		return ""
-	}
-	transcript := strings.TrimSpace(html.UnescapeString(m[1]))
-	transcript = strings.ReplaceAll(transcript, "\n", " ")
-	transcript = strings.Join(strings.Fields(transcript), " ")
-	return transcript
-}
 
 // resolveAgentRoute determines which agent should handle a message
 // based on config bindings. Priority: peer → channel → default.

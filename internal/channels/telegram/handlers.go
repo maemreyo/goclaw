@@ -25,7 +25,7 @@ type dmAffinity struct {
 // voiceAffinityTTL returns the configured DM affinity TTL for the channel,
 // falling back to defaultVoiceAffinityTTL (6h) when not explicitly set.
 func (c *Channel) voiceAffinityTTL() time.Duration {
-	if mins := c.config.VoiceAffinityTTLMinutes; mins > 0 {
+	if mins := c.config.Voice.AffinityTTLMinutes; mins > 0 {
 		return time.Duration(mins) * time.Minute
 	}
 	return defaultVoiceAffinityTTL
@@ -395,69 +395,10 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		peerKind = "group"
 	}
 
-	// Audio-aware routing: if a voice/audio message was received and a dedicated voice agent
-	// is configured, route to that agent instead of the default channel agent.
-	// This prevents voice turns from landing on a text-router agent that cannot handle audio.
-	targetAgentID := c.AgentID()
-	if c.config.VoiceAgentID != "" {
-		routeReason := ""
-		for _, m := range mediaList {
-			if m.Type == "audio" || m.Type == "voice" {
-				targetAgentID = c.config.VoiceAgentID
-				routeReason = "audio_media"
-				break
-			}
-		}
-
-		if routeReason == "" && !isGroup {
-			normalized := strings.ToLower(strings.TrimSpace(content))
-			switch {
-			case normalized == "/start" || normalized == "start":
-				targetAgentID = c.config.VoiceAgentID
-				routeReason = "start_command"
-				// Rewrite /start content so the voice agent receives context rather than a bare command.
-				startMsg := c.config.VoiceStartMessage
-				if startMsg == "" {
-					startMsg = "User sent /start."
-				}
-				finalContent = startMsg
-			case c.matchesVoiceIntent(normalized):
-				targetAgentID = c.config.VoiceAgentID
-				routeReason = "voice_intent"
-			}
-
-			if routeReason == "" {
-				if c.matchesAffinityClear(normalized) {
-					c.dmAgentAffinity.Delete(chatIDStr)
-					slog.Info("telegram: cleared DM affinity (keyword match)", "chat_id", chatIDStr)
-				} else if v, ok := c.dmAgentAffinity.Load(chatIDStr); ok {
-					if affinity, ok := v.(dmAffinity); ok {
-						if time.Since(affinity.UpdatedAt) <= c.voiceAffinityTTL() && affinity.AgentID != "" {
-							targetAgentID = affinity.AgentID
-							routeReason = "session_affinity"
-						} else {
-							c.dmAgentAffinity.Delete(chatIDStr)
-						}
-					}
-				}
-			}
-		}
-
-		if routeReason == "audio_media" || routeReason == "start_command" || routeReason == "voice_intent" || routeReason == "session_affinity" {
-			c.dmAgentAffinity.Store(chatIDStr, dmAffinity{
-				AgentID:   c.config.VoiceAgentID,
-				UpdatedAt: time.Now(),
-			})
-		}
-
-		if routeReason != "" {
-			slog.Info("telegram: routing inbound to voice agent",
-				"agent_id", targetAgentID,
-				"reason", routeReason,
-				"peer_kind", peerKind,
-			)
-		}
-	}
+	// Audio-aware routing: delegate to resolveTargetAgent so that the priority
+	// chain (audio_media → start_command → voice_intent → session_affinity) is
+	// independently testable without Telegram bot dependencies.
+	targetAgentID, finalContent = c.resolveTargetAgent(chatIDStr, isGroup, mediaList, finalContent)
 
 	c.Bus().PublishInbound(bus.InboundMessage{
 		Channel:      c.Name(),
@@ -482,12 +423,12 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 // the deployment-configured VoiceIntentKeywords. Returns false when the keyword list is empty,
 // effectively disabling text-intent routing for deployments that don't need it.
 func (c *Channel) matchesVoiceIntent(normalized string) bool {
-	if len(c.config.VoiceIntentKeywords) == 0 || normalized == "" {
+	if len(c.config.Voice.IntentKeywords) == 0 || normalized == "" {
 		return false
 	}
 	// Lowercase each keyword defensively: the caller already lowercases the
 	// inbound text, but config keywords may arrive with mixed case from DB.
-	for _, kw := range c.config.VoiceIntentKeywords {
+	for _, kw := range c.config.Voice.IntentKeywords {
 		if strings.Contains(normalized, strings.ToLower(kw)) {
 			return true
 		}
@@ -499,12 +440,12 @@ func (c *Channel) matchesVoiceIntent(normalized string) bool {
 // VoiceAffinityClearKeywords, which signals that the user wants a non-voice agent. Returns false
 // when the keyword list is empty (affinity is then only cleared by TTL expiry).
 func (c *Channel) matchesAffinityClear(normalized string) bool {
-	if len(c.config.VoiceAffinityClearKeywords) == 0 || normalized == "" {
+	if len(c.config.Voice.AffinityClearKeywords) == 0 || normalized == "" {
 		return false
 	}
 	// Lowercase each keyword defensively: the caller already lowercases the
 	// inbound text, but config keywords may arrive with mixed case from DB.
-	for _, kw := range c.config.VoiceAffinityClearKeywords {
+	for _, kw := range c.config.Voice.AffinityClearKeywords {
 		if strings.Contains(normalized, strings.ToLower(kw)) {
 			return true
 		}
@@ -585,4 +526,106 @@ func isServiceMessage(msg *telego.Message) bool {
 	// No user content — likely a service message (new_chat_members, left_chat_member,
 	// new_chat_title, new_chat_photo, pinned_message, etc.)
 	return true
+}
+
+// resolveTargetAgent decides which agent should handle the inbound message and
+// whether the content should be rewritten (e.g. /start → StartMessage).
+//
+// Priority chain:
+//   1. Audio/voice media present         → always route to Voice.AgentID
+//   2. /start or "start" text (DM only)  → route + rewrite content
+//   3. Text matches IntentKeywords (DM)  → route + set affinity
+//   4. Existing non-expired affinity (DM)→ continue routing to affinity agent
+//   5. AffinityClearKeywords match (DM)  → evict affinity, route to default
+//   6. Fallback                          → route to default agent
+//
+// No I/O side-effects: no Telegram API calls, no bus publish.
+// State mutations (dmAgentAffinity store/delete) are intentional and fully
+// contained here — this function is the single owner of affinity state changes.
+func (c *Channel) resolveTargetAgent(
+	chatIDStr string,
+	isGroup bool,
+	mediaList []MediaInfo,
+	content string,
+) (agentID string, finalContent string) {
+	agentID = c.AgentID()
+	finalContent = content
+
+	voiceAgentID := c.config.Voice.AgentID
+	if voiceAgentID == "" {
+		// Voice routing not configured — every message goes to the default agent.
+		return
+	}
+
+	routeReason := ""
+
+	// Priority 1: audio/voice media present — highest priority, applies in groups too.
+	for _, m := range mediaList {
+		if m.Type == "audio" || m.Type == "voice" {
+			agentID = voiceAgentID
+			routeReason = "audio_media"
+			break
+		}
+	}
+
+	// Priorities 2–5 only apply to DMs.
+	if routeReason == "" && !isGroup {
+		normalized := strings.ToLower(strings.TrimSpace(content))
+
+		switch {
+		case normalized == "/start" || normalized == "start":
+			// Priority 2: /start → bootstrap the voice session.
+			agentID = voiceAgentID
+			routeReason = "start_command"
+			startMsg := c.config.Voice.StartMessage
+			if startMsg == "" {
+				startMsg = "User sent /start."
+			}
+			finalContent = startMsg
+
+		case c.matchesVoiceIntent(normalized):
+			// Priority 3: keyword signals the user wants a voice interaction.
+			agentID = voiceAgentID
+			routeReason = "voice_intent"
+		}
+
+		if routeReason == "" {
+			if c.matchesAffinityClear(normalized) {
+				// Priority 5: user switched away from voice practice.
+				c.dmAgentAffinity.Delete(chatIDStr)
+				slog.Info("telegram: cleared DM affinity (keyword match)", "chat_id", chatIDStr)
+			} else if v, ok := c.dmAgentAffinity.Load(chatIDStr); ok {
+				// Priority 4: sticky session — keep routing to the affinity agent.
+				if affinity, ok := v.(dmAffinity); ok {
+					if time.Since(affinity.UpdatedAt) <= c.voiceAffinityTTL() && affinity.AgentID != "" {
+						agentID = affinity.AgentID
+						routeReason = "session_affinity"
+					} else {
+						// TTL expired — evict.
+						c.dmAgentAffinity.Delete(chatIDStr)
+					}
+				}
+			}
+		}
+	}
+
+	// Persist affinity for DM routes that reach the voice agent.
+	// Group chats are excluded: affinity is only read inside the !isGroup block,
+	// so storing a group chatID would waste sync.Map space that is never reclaimed.
+	if !isGroup && (routeReason == "audio_media" || routeReason == "start_command" ||
+		routeReason == "voice_intent" || routeReason == "session_affinity") {
+		c.dmAgentAffinity.Store(chatIDStr, dmAffinity{
+			AgentID:   voiceAgentID,
+			UpdatedAt: time.Now(),
+		})
+	}
+
+	if routeReason != "" {
+		slog.Info("telegram: routing inbound to voice agent",
+			"agent_id", agentID,
+			"reason", routeReason,
+			"is_group", isGroup,
+		)
+	}
+	return
 }

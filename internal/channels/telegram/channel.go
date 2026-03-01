@@ -35,6 +35,7 @@ type Channel struct {
 	threadIDs        sync.Map         // localKey string → messageThreadID int (for forum topic routing)
 	approvedGroups   sync.Map         // chatIDStr string → true (cached group pairing approval)
 	dmAgentAffinity  sync.Map         // chatIDStr string → dmAffinity (sticky DM route)
+	sttSem           sttSem           // bounds parallel STT HTTP calls to sttMaxConcurrent
 	groupHistory     *channels.PendingHistory
 	historyLimit     int
 	requireMention   bool
