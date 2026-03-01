@@ -34,7 +34,7 @@ type sttResponse struct {
 //   - filePath is empty (download failed earlier in the pipeline).
 //
 // Any HTTP or parse error is returned so the caller can log it and fall back gracefully.
-// This matches the TS speaking-service /transcribe_audio contract used in managed deployments.
+// This matches the /transcribe_audio contract: multipart fields "audio" (file) and "tenant_id".
 func (c *Channel) transcribeAudio(ctx context.Context, filePath string) (string, error) {
 	if c.config.STTProxyURL == "" {
 		// STT not configured — skip silently.

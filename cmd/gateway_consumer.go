@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -46,7 +45,6 @@ func makeSchedulerRunFunc(agents *agent.Router, cfg *config.Config) scheduler.Ru
 // (matching TS subagent-announce.ts pattern) so the agent can reformulate for the user.
 func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents *agent.Router, cfg *config.Config, sched *scheduler.Scheduler, channelMgr *channels.Manager, teamStore store.TeamStore) {
 	slog.Info("inbound message consumer started")
-	defaultTenantID := resolveEduOSTenantID()
 
 	// Inbound message deduplication (matching TS src/infra/dedupe.ts + inbound-dedupe.ts).
 	// TTL=20min, max=5000 entries — prevents webhook retries / double-taps from duplicating agent runs.
@@ -155,29 +153,16 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				"- Keep responses concise and focused; long replies are disruptive in groups.\n" +
 				"- Address the group naturally. If the history shows a multi-person conversation, consider the full context before answering."
 		}
-		if agentID == "speaking-agent" && peerKind == string(sessions.PeerDirect) {
-			internalIdentityPrompt := fmt.Sprintf(
-				"You are in a private 1-on-1 student session on EduOS.\n"+
-					"Internal runtime identifiers (system-provided):\n"+
-					"- tenant_id: %s\n"+
-					"- student_id: %s\n"+
-					"Rules:\n"+
-					"- NEVER ask the student for tenant_id/student_id or any technical/internal ID.\n"+
-					"- For speaking tools that require tenant_id/student_id, always use these values.\n"+
-					"- Telegram audio notes may arrive as <media:voice>/<media:audio> tags with an inline <transcript>...</transcript> block.\n"+
-					"- When a transcript block exists, extract it and use text-based evaluation tools (e.g., evaluate_transcript).\n"+
-					"- On Telegram, NEVER call evaluate_audio or submit_audio_job for <media:voice>/<media:audio> placeholders.\n"+
-					"- If transcript is missing, ask the student to resend audio more clearly; do not restart onboarding or ask technical IDs.\n"+
-					"- NEVER tell students about internal/system/tool errors (e.g. 'system error', 'technical issue', 'exit status', 'rate limit').\n"+
-					"- If any tool fails, continue with best-effort coaching from available transcript/text and ask for a retry naturally.\n"+
-					"- If a tool still fails due profile mismatch/not found, continue coaching without asking for technical IDs.",
-				defaultTenantID,
-				userID,
-			)
-			if extraPrompt != "" {
-				extraPrompt += "\n\n" + internalIdentityPrompt
-			} else {
-				extraPrompt = internalIdentityPrompt
+		if agentID == cfg.Channels.Telegram.VoiceAgentID && cfg.Channels.Telegram.VoiceAgentID != "" && peerKind == string(sessions.PeerDirect) {
+			if tmpl := cfg.Channels.Telegram.VoiceDMContextTemplate; tmpl != "" {
+				// Substitute {user_id} — the only runtime value the gateway knows.
+				// All other deployment-specific values (e.g. tenant_id) are baked into the template.
+				voiceCtx := strings.ReplaceAll(tmpl, "{user_id}", userID)
+				if extraPrompt != "" {
+					extraPrompt += "\n\n" + voiceCtx
+				} else {
+					extraPrompt = voiceCtx
+				}
 			}
 		}
 
@@ -271,7 +256,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			}
 
 			replyContent := outcome.Result.Content
-			replyContent = sanitizeSpeakingAudioStudentReply(agentKey, channel, peer, originalContent, replyContent)
+			replyContent = sanitizeVoiceAgentReply(cfg.Channels.Telegram.VoiceAgentID, agentKey, channel, peer, originalContent, replyContent, cfg.Channels.Telegram)
 
 			// Publish response back to the channel
 			outMsg := bus.OutboundMessage{
@@ -700,19 +685,29 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 	}
 }
 
-func resolveEduOSTenantID() string {
-	for _, key := range []string{"GOCLAW_EDUOS_TENANT_ID", "GOCLAW_TENANT_ID", "TENANT_ID"} {
-		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-			return v
-		}
-	}
-	return "default"
-}
-
 var transcriptTagRe = regexp.MustCompile(`(?s)<transcript>(.*?)</transcript>`)
 
-func sanitizeSpeakingAudioStudentReply(agentID, channel, peerKind, inboundContent, reply string) string {
-	if agentID != "speaking-agent" || channel != "telegram" || peerKind != string(sessions.PeerDirect) {
+// defaultAudioFallbackTranscript is the generic fallback sent when a voice-agent DM reply
+// contains technical error language and a transcript is available (%s = transcript text).
+const defaultAudioFallbackTranscript = "🎙️ Got your voice message! I heard: \"%s\"\n\n" +
+	"There was a brief hiccup on my end — please send your response again and I'll review it straight away."
+
+// defaultAudioFallbackNoTranscript is the generic fallback when no transcript is available.
+const defaultAudioFallbackNoTranscript = "🎙️ Got your voice message!\n\n" +
+	"I had a little trouble processing it — could you send it again or type your response? I'll get back to you right away."
+
+// sanitizeVoiceAgentReply intercepts replies from the configured voice agent on Telegram DMs.
+// When the agent's reply contains technical error language AND the inbound message contained
+// an audio/voice tag, the reply is replaced with a user-friendly coaching fallback so that
+// internal errors (exit status, rate limit, tool failures, etc.) are never exposed to the user.
+//
+// voiceAgentID is cfg.Channels.Telegram.VoiceAgentID.
+// tgCfg is the Telegram channel config (provides optional custom fallback strings).
+func sanitizeVoiceAgentReply(voiceAgentID, agentID, channel, peerKind, inboundContent, reply string, tgCfg config.TelegramConfig) string {
+	if voiceAgentID == "" || agentID != voiceAgentID {
+		return reply
+	}
+	if channel != "telegram" || peerKind != string(sessions.PeerDirect) {
 		return reply
 	}
 	if !strings.Contains(inboundContent, "<media:voice>") && !strings.Contains(inboundContent, "<media:audio>") {
@@ -724,13 +719,18 @@ func sanitizeSpeakingAudioStudentReply(agentID, channel, peerKind, inboundConten
 
 	transcript := extractTranscriptFromInbound(inboundContent)
 	if transcript != "" {
-		return fmt.Sprintf(
-			"🎙️ Mình đã nhận transcript của bạn: \"%s\"\n\n✅ Bạn trả lời đúng hướng rồi.\n🎯 Bây giờ mở rộng thêm 2-3 câu theo cấu trúc: trả lời trực tiếp -> lý do -> ví dụ ngắn.\n\nGửi câu trả lời tiếp theo (voice hoặc text), mình chấm chi tiết ngay.",
-			transcript,
-		)
+		tpl := tgCfg.AudioGuardFallbackTranscript
+		if tpl == "" {
+			tpl = defaultAudioFallbackTranscript
+		}
+		return fmt.Sprintf(tpl, transcript)
 	}
 
-	return "🎙️ Mình đã nhận voice của bạn rồi.\n\n🎯 Bạn nói lại chậm hơn một chút và gửi lại 1 lần nhé. Mình sẽ chấm ngay khi nhận được nội dung rõ hơn."
+	msg := tgCfg.AudioGuardFallbackNoTranscript
+	if msg == "" {
+		msg = defaultAudioFallbackNoTranscript
+	}
+	return msg
 }
 
 func containsTechnicalErrorLanguage(s string) bool {

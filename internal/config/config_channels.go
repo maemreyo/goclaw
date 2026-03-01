@@ -28,12 +28,55 @@ type TelegramConfig struct {
 	// When stt_proxy_url is set, audio/voice messages are transcribed before being forwarded to the agent.
 	STTProxyURL       string `json:"stt_proxy_url,omitempty"`       // base URL of the STT proxy service (e.g. "https://stt.example.com")
 	STTAPIKey         string `json:"stt_api_key,omitempty"`         // Bearer token for the STT proxy
-	STTTenantID       string `json:"stt_tenant_id,omitempty"`       // optional tenant/org identifier forwarded to the STT proxy
+	STTTenantID       string `json:"stt_tenant_id,omitempty"`       // extra field forwarded to the STT proxy; settable via GOCLAW_STT_TENANT_ID env var
 	STTTimeoutSeconds int    `json:"stt_timeout_seconds,omitempty"` // per-request timeout for STT calls (default 30s)
 
 	// Optional audio-aware routing: when set, voice/audio inbound messages are routed to this
 	// agent instead of the default channel agent. Requires the named agent to exist in the config.
 	VoiceAgentID string `json:"voice_agent_id,omitempty"` // agent ID to route voice inbound to (e.g. "speaking-agent")
+
+	// VoiceStartMessage is the content injected when a DM /start (or "start") is received
+	// while VoiceAgentID is configured. Lets deployments give the voice agent useful context
+	// without hardcoding language or domain in Go code.
+	// If empty, a generic "User sent /start." message is used.
+	VoiceStartMessage string `json:"voice_start_message,omitempty"`
+
+	// VoiceIntentKeywords is an optional list of lowercase substrings. When a DM text message
+	// contains any of these substrings it is routed to VoiceAgentID and the DM affinity is set.
+	// If empty (default), keyword-based intent routing is disabled — only audio media and
+	// existing affinity trigger routing to the voice agent.
+	// Example: ["speaking", "pronunciation", "ielts part"]
+	VoiceIntentKeywords []string `json:"voice_intent_keywords,omitempty"`
+
+	// VoiceAffinityClearKeywords is an optional list of lowercase substrings. When a DM text
+	// matches any of these substrings the DM affinity is cleared, so the next message routes
+	// back to the default channel agent.
+	// If empty (default), affinity is only cleared by TTL expiry.
+	// Example: ["homework", "payment", "schedule"]
+	VoiceAffinityClearKeywords []string `json:"voice_affinity_clear_keywords,omitempty"`
+
+	// VoiceAffinityTTLMinutes is how long (in minutes) a DM affinity entry is kept after the
+	// last voice-agent interaction. 0 means use the built-in default (360 = 6 hours).
+	VoiceAffinityTTLMinutes int `json:"voice_affinity_ttl_minutes,omitempty"`
+
+	// VoiceDMContextTemplate is an optional string injected as extra system prompt when the
+	// voice agent handles a Telegram DM. Supports one placeholder: {user_id} (substituted with
+	// the Telegram user's ID at runtime). All other deployment-specific values (e.g. tenant_id)
+	// should be baked directly into the template string.
+	// If empty, no extra context is injected.
+	// Settable via GOCLAW_VOICE_DM_CONTEXT_TEMPLATE env var.
+	// Example:
+	//   "Runtime context:\n- tenant_id: my-school\n- user_id: {user_id}\nNEVER expose errors."
+	VoiceDMContextTemplate string `json:"voice_dm_context_template,omitempty"`
+
+	// Optional audio guard: fallback messages sent to the user when a voice-agent DM reply
+	// contains technical error language. Allows per-deployment customisation without forking Go code.
+	//   audio_guard_fallback_transcript   — used when a <transcript> block is present in the inbound message.
+	//                                       Supports %s as a placeholder for the transcript text.
+	//   audio_guard_fallback_no_transcript — used when no transcript is available.
+	// If either field is empty the gateway uses a built-in generic English message.
+	AudioGuardFallbackTranscript   string `json:"audio_guard_fallback_transcript,omitempty"`
+	AudioGuardFallbackNoTranscript string `json:"audio_guard_fallback_no_transcript,omitempty"`
 }
 
 type DiscordConfig struct {

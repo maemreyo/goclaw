@@ -18,20 +18,27 @@ type telegramCreds struct {
 
 // telegramInstanceConfig maps the non-secret config JSONB from the channel_instances table.
 type telegramInstanceConfig struct {
-	DMPolicy       string   `json:"dm_policy,omitempty"`
-	GroupPolicy    string   `json:"group_policy,omitempty"`
-	RequireMention *bool    `json:"require_mention,omitempty"`
-	HistoryLimit   int      `json:"history_limit,omitempty"`
-	StreamMode     string   `json:"stream_mode,omitempty"`
-	ReactionLevel  string   `json:"reaction_level,omitempty"`
-	MediaMaxBytes  int64    `json:"media_max_bytes,omitempty"`
-	LinkPreview    *bool    `json:"link_preview,omitempty"`
-	AllowFrom      []string `json:"allow_from,omitempty"`
-	STTProxyURL    string   `json:"stt_proxy_url,omitempty"`
-	STTAPIKey      string   `json:"stt_api_key,omitempty"`
-	STTTenantID    string   `json:"stt_tenant_id,omitempty"`
-	STTTimeoutSec  int      `json:"stt_timeout_seconds,omitempty"`
-	VoiceAgentID   string   `json:"voice_agent_id,omitempty"`
+	DMPolicy                       string   `json:"dm_policy,omitempty"`
+	GroupPolicy                    string   `json:"group_policy,omitempty"`
+	RequireMention                 *bool    `json:"require_mention,omitempty"`
+	HistoryLimit                   int      `json:"history_limit,omitempty"`
+	StreamMode                     string   `json:"stream_mode,omitempty"`
+	ReactionLevel                  string   `json:"reaction_level,omitempty"`
+	MediaMaxBytes                  int64    `json:"media_max_bytes,omitempty"`
+	LinkPreview                    *bool    `json:"link_preview,omitempty"`
+	AllowFrom                      []string `json:"allow_from,omitempty"`
+	STTProxyURL                    string   `json:"stt_proxy_url,omitempty"`
+	STTAPIKey                      string   `json:"stt_api_key,omitempty"`
+	STTTenantID                    string   `json:"stt_tenant_id,omitempty"`
+	STTTimeoutSec                  int      `json:"stt_timeout_seconds,omitempty"`
+	VoiceAgentID                   string   `json:"voice_agent_id,omitempty"`
+	VoiceStartMessage              string   `json:"voice_start_message,omitempty"`
+	VoiceIntentKeywords            []string `json:"voice_intent_keywords,omitempty"`
+	VoiceAffinityClearKeywords     []string `json:"voice_affinity_clear_keywords,omitempty"`
+	VoiceAffinityTTLMinutes        int      `json:"voice_affinity_ttl_minutes,omitempty"`
+	VoiceDMContextTemplate         string   `json:"voice_dm_context_template,omitempty"`
+	AudioGuardFallbackTranscript   string   `json:"audio_guard_fallback_transcript,omitempty"`
+	AudioGuardFallbackNoTranscript string   `json:"audio_guard_fallback_no_transcript,omitempty"`
 }
 
 // Factory creates a Telegram channel from DB instance data (no agent/team store).
@@ -70,23 +77,30 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 	}
 
 	tgCfg := config.TelegramConfig{
-		Enabled:           true,
-		Token:             c.Token,
-		Proxy:             c.Proxy,
-		AllowFrom:         ic.AllowFrom,
-		DMPolicy:          ic.DMPolicy,
-		GroupPolicy:       ic.GroupPolicy,
-		RequireMention:    ic.RequireMention,
-		HistoryLimit:      ic.HistoryLimit,
-		StreamMode:        ic.StreamMode,
-		ReactionLevel:     ic.ReactionLevel,
-		MediaMaxBytes:     ic.MediaMaxBytes,
-		LinkPreview:       ic.LinkPreview,
-		STTProxyURL:       ic.STTProxyURL,
-		STTAPIKey:         ic.STTAPIKey,
-		STTTenantID:       ic.STTTenantID,
-		STTTimeoutSeconds: ic.STTTimeoutSec,
-		VoiceAgentID:      ic.VoiceAgentID,
+		Enabled:                        true,
+		Token:                          c.Token,
+		Proxy:                          c.Proxy,
+		AllowFrom:                      ic.AllowFrom,
+		DMPolicy:                       ic.DMPolicy,
+		GroupPolicy:                    ic.GroupPolicy,
+		RequireMention:                 ic.RequireMention,
+		HistoryLimit:                   ic.HistoryLimit,
+		StreamMode:                     ic.StreamMode,
+		ReactionLevel:                  ic.ReactionLevel,
+		MediaMaxBytes:                  ic.MediaMaxBytes,
+		LinkPreview:                    ic.LinkPreview,
+		STTProxyURL:                    ic.STTProxyURL,
+		STTAPIKey:                      ic.STTAPIKey,
+		STTTenantID:                    ic.STTTenantID,
+		STTTimeoutSeconds:              ic.STTTimeoutSec,
+		VoiceAgentID:                   ic.VoiceAgentID,
+		VoiceStartMessage:              ic.VoiceStartMessage,
+		VoiceIntentKeywords:            ic.VoiceIntentKeywords,
+		VoiceAffinityClearKeywords:     ic.VoiceAffinityClearKeywords,
+		VoiceAffinityTTLMinutes:        ic.VoiceAffinityTTLMinutes,
+		VoiceDMContextTemplate:         ic.VoiceDMContextTemplate,
+		AudioGuardFallbackTranscript:   ic.AudioGuardFallbackTranscript,
+		AudioGuardFallbackNoTranscript: ic.AudioGuardFallbackNoTranscript,
 	}
 
 	// DB instances default to "pairing" for groups (secure by default).

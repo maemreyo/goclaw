@@ -285,6 +285,71 @@ func TestTranscribeAudio_EmptyTranscript(t *testing.T) {
 	}
 }
 
+// TestTranscribeAudio_OldFileFieldMustNotBeUsed guards against regression to the old "file"
+// multipart field name. The speaking-service /transcribe_audio contract requires "audio".
+func TestTranscribeAudio_OldFileFieldMustNotBeUsed(t *testing.T) {
+	audioFile := writeTempAudio(t, "fake-ogg-bytes")
+	defer os.Remove(audioFile)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("parse multipart: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		// The legacy "file" field must NOT be present.
+		if r.MultipartForm != nil && r.MultipartForm.File != nil {
+			if _, ok := r.MultipartForm.File["file"]; ok {
+				t.Error("deprecated 'file' field found in multipart form; must use 'audio'")
+			}
+		}
+		// The required "audio" field must be present.
+		if _, _, err := r.FormFile("audio"); err != nil {
+			t.Errorf("required 'audio' field missing from multipart form: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sttResponse{Transcript: "ok"})
+	}))
+	defer srv.Close()
+
+	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestTranscribeAudio_GoclawSTTTenantIDEnvOverride verifies that the GOCLAW_STT_TENANT_ID
+// env var (set via applyEnvOverrides) is picked up as STTTenantID. This test simulates what
+// applyEnvOverrides does: it pre-populates config.STTTenantID from the env var before the
+// channel is created. The stt layer only reads from config — it never reads env directly.
+func TestTranscribeAudio_GoclawSTTTenantIDEnvOverride(t *testing.T) {
+	audioFile := writeTempAudio(t, "fake-ogg-bytes")
+	defer os.Remove(audioFile)
+
+	const wantTenant = "goclaw-stt-corp"
+	var gotTenant string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err == nil {
+			gotTenant = r.FormValue("tenant_id")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sttResponse{Transcript: "ok"})
+	}))
+	defer srv.Close()
+
+	// applyEnvOverrides would have populated STTTenantID from GOCLAW_STT_TENANT_ID before here.
+	c := newChannelWithSTT(config.TelegramConfig{
+		STTProxyURL: srv.URL,
+		STTTenantID: wantTenant, // simulates applyEnvOverrides having set this from env
+	})
+	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotTenant != wantTenant {
+		t.Errorf("expected tenant_id %q, got %q", wantTenant, gotTenant)
+	}
+}
+
 // TestTranscribeAudio_ContextCancelled verifies that a cancelled context causes
 // the HTTP call to fail fast.
 func TestTranscribeAudio_ContextCancelled(t *testing.T) {

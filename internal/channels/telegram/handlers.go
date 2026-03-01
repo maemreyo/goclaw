@@ -15,11 +15,20 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
 )
 
-const dmAffinityTTL = 6 * time.Hour
+const defaultVoiceAffinityTTL = 6 * time.Hour
 
 type dmAffinity struct {
 	AgentID   string
 	UpdatedAt time.Time
+}
+
+// voiceAffinityTTL returns the configured DM affinity TTL for the channel,
+// falling back to defaultVoiceAffinityTTL (6h) when not explicitly set.
+func (c *Channel) voiceAffinityTTL() time.Duration {
+	if mins := c.config.VoiceAffinityTTLMinutes; mins > 0 {
+		return time.Duration(mins) * time.Minute
+	}
+	return defaultVoiceAffinityTTL
 }
 
 // handleMessage processes an incoming Telegram update.
@@ -386,7 +395,7 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		peerKind = "group"
 	}
 
-	// Audio-aware routing: if a voice/audio message was received and a dedicated speaking agent
+	// Audio-aware routing: if a voice/audio message was received and a dedicated voice agent
 	// is configured, route to that agent instead of the default channel agent.
 	// This prevents voice turns from landing on a text-router agent that cannot handle audio.
 	targetAgentID := c.AgentID()
@@ -406,20 +415,24 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 			case normalized == "/start" || normalized == "start":
 				targetAgentID = c.config.VoiceAgentID
 				routeReason = "start_command"
-				// Normalize /start into an explicit learning intent for speaking-agent.
-				finalContent = "Bắt đầu buổi luyện speaking hôm nay. User vừa gửi lệnh /start."
-			case looksLikeSpeakingIntent(normalized):
+				// Rewrite /start content so the voice agent receives context rather than a bare command.
+				startMsg := c.config.VoiceStartMessage
+				if startMsg == "" {
+					startMsg = "User sent /start."
+				}
+				finalContent = startMsg
+			case c.matchesVoiceIntent(normalized):
 				targetAgentID = c.config.VoiceAgentID
-				routeReason = "speaking_intent"
+				routeReason = "voice_intent"
 			}
 
 			if routeReason == "" {
-				if looksLikeNonSpeakingIntent(normalized) {
+				if c.matchesAffinityClear(normalized) {
 					c.dmAgentAffinity.Delete(chatIDStr)
-					slog.Info("telegram: cleared DM affinity due to non-speaking intent", "chat_id", chatIDStr)
+					slog.Info("telegram: cleared DM affinity (keyword match)", "chat_id", chatIDStr)
 				} else if v, ok := c.dmAgentAffinity.Load(chatIDStr); ok {
 					if affinity, ok := v.(dmAffinity); ok {
-						if time.Since(affinity.UpdatedAt) <= dmAffinityTTL && affinity.AgentID != "" {
+						if time.Since(affinity.UpdatedAt) <= c.voiceAffinityTTL() && affinity.AgentID != "" {
 							targetAgentID = affinity.AgentID
 							routeReason = "session_affinity"
 						} else {
@@ -430,7 +443,7 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 			}
 		}
 
-		if routeReason == "audio_media" || routeReason == "start_command" || routeReason == "speaking_intent" || routeReason == "session_affinity" {
+		if routeReason == "audio_media" || routeReason == "start_command" || routeReason == "voice_intent" || routeReason == "session_affinity" {
 			c.dmAgentAffinity.Store(chatIDStr, dmAffinity{
 				AgentID:   c.config.VoiceAgentID,
 				UpdatedAt: time.Now(),
@@ -438,7 +451,7 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		}
 
 		if routeReason != "" {
-			slog.Info("telegram: routing inbound to dedicated speaking agent",
+			slog.Info("telegram: routing inbound to voice agent",
 				"agent_id", targetAgentID,
 				"reason", routeReason,
 				"peer_kind", peerKind,
@@ -465,28 +478,14 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	}
 }
 
-func looksLikeSpeakingIntent(normalized string) bool {
-	if normalized == "" {
+// matchesVoiceIntent reports whether normalized (lowercased, trimmed) DM text contains any of
+// the deployment-configured VoiceIntentKeywords. Returns false when the keyword list is empty,
+// effectively disabling text-intent routing for deployments that don't need it.
+func (c *Channel) matchesVoiceIntent(normalized string) bool {
+	if len(c.config.VoiceIntentKeywords) == 0 || normalized == "" {
 		return false
 	}
-
-	keywords := []string{
-		"speaking",
-		"luyen noi",
-		"luyện nói",
-		"luyen speaking",
-		"hoc speaking",
-		"học speaking",
-		"do you prefer",
-		"pronunciation",
-		"phat am",
-		"phát âm",
-		"ielts part 1",
-		"ielts part 2",
-		"ielts part 3",
-	}
-
-	for _, kw := range keywords {
+	for _, kw := range c.config.VoiceIntentKeywords {
 		if strings.Contains(normalized, kw) {
 			return true
 		}
@@ -494,25 +493,14 @@ func looksLikeSpeakingIntent(normalized string) bool {
 	return false
 }
 
-func looksLikeNonSpeakingIntent(normalized string) bool {
-	if normalized == "" {
+// matchesAffinityClear reports whether normalized DM text matches any of the deployment-configured
+// VoiceAffinityClearKeywords, which signals that the user wants a non-voice agent. Returns false
+// when the keyword list is empty (affinity is then only cleared by TTL expiry).
+func (c *Channel) matchesAffinityClear(normalized string) bool {
+	if len(c.config.VoiceAffinityClearKeywords) == 0 || normalized == "" {
 		return false
 	}
-
-	keywords := []string{
-		// Finance
-		"học phí", "hoc phi", "đóng tiền", "dong tien", "payment", "invoice", "công nợ", "cong no",
-		// Homework
-		"bài tập", "bai tap", "homework", "nộp bài", "nop bai", "deadline",
-		// Schedule
-		"lịch", "lich", "schedule", "xin nghỉ", "xin nghi", "nghỉ học", "nghi hoc", "lịch bù", "lich bu", "makeup",
-		// Admissions
-		"khóa học", "khoa hoc", "đăng ký", "dang ky", "tư vấn", "tu van", "học thử", "hoc thu", "course info",
-		// Writing
-		"writing", "essay", "chấm bài", "cham bai", "task 1", "task 2",
-	}
-
-	for _, kw := range keywords {
+	for _, kw := range c.config.VoiceAffinityClearKeywords {
 		if strings.Contains(normalized, kw) {
 			return true
 		}
