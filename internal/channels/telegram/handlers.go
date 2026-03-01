@@ -398,7 +398,7 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	// Audio-aware routing: delegate to resolveTargetAgent so that the priority
 	// chain (audio_media → start_command → voice_intent → session_affinity) is
 	// independently testable without Telegram bot dependencies.
-	targetAgentID, finalContent = c.resolveTargetAgent(chatIDStr, isGroup, mediaList, finalContent)
+	targetAgentID, finalContent := c.resolveTargetAgent(chatIDStr, isGroup, mediaList, finalContent)
 
 	c.Bus().PublishInbound(bus.InboundMessage{
 		Channel:      c.Name(),

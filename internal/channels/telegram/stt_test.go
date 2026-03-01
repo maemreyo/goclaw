@@ -52,7 +52,9 @@ func TestTranscribeAudio_NoProxy(t *testing.T) {
 // no-op even when STT is configured.
 func TestTranscribeAudio_EmptyFilePath(t *testing.T) {
 	c := newChannelWithSTT(config.TelegramConfig{
-		STTProxyURL: "https://stt.example.com",
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: "https://stt.example.com",
+		},
 	})
 	transcript, err := c.transcribeAudio(context.Background(), "")
 	if err != nil {
@@ -72,7 +74,11 @@ func TestTranscribeAudio_MissingFile(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	_, err := c.transcribeAudio(context.Background(), "/nonexistent/file.ogg")
 	if err == nil {
 		t.Fatal("expected an error for missing file, got nil")
@@ -107,7 +113,11 @@ func TestTranscribeAudio_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	transcript, err := c.transcribeAudio(context.Background(), audioFile)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -134,8 +144,10 @@ func TestTranscribeAudio_BearerToken(t *testing.T) {
 	defer srv.Close()
 
 	c := newChannelWithSTT(config.TelegramConfig{
-		STTProxyURL: srv.URL,
-		STTAPIKey:   wantKey,
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+			STTAPIKey:   wantKey,
+		},
 	})
 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -160,7 +172,11 @@ func TestTranscribeAudio_NoAuthHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -185,8 +201,10 @@ func TestTranscribeAudio_TenantID(t *testing.T) {
 	defer srv.Close()
 
 	c := newChannelWithSTT(config.TelegramConfig{
-		STTProxyURL: srv.URL,
-		STTTenantID: wantTenant,
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+			STTTenantID: wantTenant,
+		},
 	})
 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -214,7 +232,11 @@ func TestTranscribeAudio_DefaultTenantFallback(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -234,7 +256,11 @@ func TestTranscribeAudio_UpstreamError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	_, err := c.transcribeAudio(context.Background(), audioFile)
 	if err == nil {
 		t.Fatal("expected error for non-200 response, got nil")
@@ -256,7 +282,11 @@ func TestTranscribeAudio_InvalidJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	_, err := c.transcribeAudio(context.Background(), audioFile)
 	if err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
@@ -275,7 +305,11 @@ func TestTranscribeAudio_EmptyTranscript(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	transcript, err := c.transcribeAudio(context.Background(), audioFile)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -312,7 +346,11 @@ func TestTranscribeAudio_OldFileFieldMustNotBeUsed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -339,8 +377,10 @@ func TestTranscribeAudio_GoclawSTTTenantIDEnvOverride(t *testing.T) {
 
 	// applyEnvOverrides would have populated STTTenantID from GOCLAW_STT_TENANT_ID before here.
 	c := newChannelWithSTT(config.TelegramConfig{
-		STTProxyURL: srv.URL,
-		STTTenantID: wantTenant, // simulates applyEnvOverrides having set this from env
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+			STTTenantID: wantTenant, // simulates applyEnvOverrides having set this from env
+		},
 	})
 	if _, err := c.transcribeAudio(context.Background(), audioFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -365,7 +405,11 @@ func TestTranscribeAudio_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	c := newChannelWithSTT(config.TelegramConfig{STTProxyURL: srv.URL})
+	c := newChannelWithSTT(config.TelegramConfig{
+		Voice: config.TelegramVoiceConfig{
+			STTProxyURL: srv.URL,
+		},
+	})
 	_, err := c.transcribeAudio(ctx, audioFile)
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
